@@ -6,7 +6,7 @@ Integração com API Mercado Pago para recebimento PIX
 import json, sqlite3, uuid, hashlib, os, threading, secrets, re
 from datetime import datetime, timedelta
 from pathlib import Path
-from flask import Flask, request, jsonify, render_template_string, redirect, url_for, session
+from flask import Flask, request, jsonify, render_template_string, redirect, url_for, session, send_from_directory
 import urllib.request, urllib.error, urllib.parse
 
 app = Flask(__name__)
@@ -20,6 +20,22 @@ MP_ACCESS_TOKEN = os.environ.get("MP_ACCESS_TOKEN", "")
 PIX_CONFIG_PATH = Path(__file__).parent / "pix_config.json"
 YOUTUBE_CONFIG_PATH = Path(__file__).parent / "youtube_config.json"
 YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY", "")
+
+GENRE_COVERS_DIR = Path(__file__).parent / "genre_covers"
+GENRE_COVERS_DIR.mkdir(exist_ok=True)
+
+DEFAULT_GENRE_COVERS = {
+    "Sertanejo": "/genre_covers/sertanejo.png",
+    "Pagode": "/genre_covers/pagode.png",
+    "Forró": "/genre_covers/forro.png",
+    "Axé": "/genre_covers/axe.png",
+    "Funk": "/genre_covers/funk.png",
+    "Rock": "/genre_covers/rock.png",
+    "Karaokê": "/genre_covers/karaoke.png",
+    "MPB": "/genre_covers/mpb.png",
+    "Samba": "/genre_covers/samba.png",
+    "Pop": "/genre_covers/pop.png",
+}
 
 def _load_saved_youtube_key():
     """Carrega a chave da API do YouTube salva no painel admin, se existir."""
@@ -168,9 +184,21 @@ def init_db():
                 db.execute("INSERT INTO genres(name,cover_url,sort_order) VALUES(?,?,?)",
                            (name, cover, order))
 
+        # Atualiza capas padrão dos gêneros, sem apagar capas que você já configurou.
+        for genre_name, cover_path in DEFAULT_GENRE_COVERS.items():
+            db.execute(
+                "UPDATE genres SET cover_url=? WHERE name=? AND (cover_url IS NULL OR cover_url='')",
+                (cover_path, genre_name)
+            )
+
         db.commit()
 
 init_db()
+
+@app.route("/genre_covers/<path:filename>")
+def genre_cover_file(filename):
+    """Serve as capas PNG dos gêneros para o painel e para a máquina."""
+    return send_from_directory(GENRE_COVERS_DIR, filename)
 
 # ─── Funções PIX (Mercado Pago) ───────────────────────────────────────────────
 def create_pix_payment(amount, description, machine_id):
@@ -270,6 +298,17 @@ def machine_check():
                 ORDER BY COALESCE(d.sort_order, 0), p.sort_order, p.id
             """, (g["id"],)).fetchall()]
             g["playlists"] = songs
+
+        # Transforma capas locais em URL completa para a máquina baixar corretamente.
+        base_url = request.host_url.rstrip("/")
+        for g in genres:
+            if g.get("cover_url") and str(g["cover_url"]).startswith("/"):
+                g["cover_url"] = base_url + g["cover_url"]
+            for p in g.get("playlists", []):
+                if p.get("dvd_cover") and str(p["dvd_cover"]).startswith("/"):
+                    p["dvd_cover"] = base_url + p["dvd_cover"]
+                if p.get("cover_url") and str(p["cover_url"]).startswith("/"):
+                    p["cover_url"] = base_url + p["cover_url"]
 
         # PIX data
         pix_data = None
@@ -582,6 +621,9 @@ header span { color: var(--muted); font-size: 13px; }
 .card:hover { border-color: var(--accent); }
 .card h3 { font-size: 15px; margin-bottom: 8px; }
 .card p { font-size: 13px; color: var(--muted); }
+.genre-card { min-height: 245px; }
+.genre-cover-img { width: 100%; height: 132px; object-fit: contain; display: block; margin-bottom: 10px; background: #050508; border: 1px solid var(--border); border-radius: 12px; }
+.genre-cover-empty { width: 100%; height: 132px; display: flex; align-items: center; justify-content: center; margin-bottom: 10px; background: #050508; border: 1px dashed var(--border); border-radius: 12px; color: var(--muted); font-size: 34px; }
 
 .badge {
     display: inline-block;
@@ -743,6 +785,8 @@ th { color: var(--muted); font-weight: 600; }
 <div id="pane-machines" class="pane active">
     <div class="row" style="margin-bottom:16px">
         <button class="btn" onclick="openModal('modal-machine')">+ Nova Máquina</button>
+        <input id="machine-search" placeholder="Buscar máquina por nome, local, ID ou token..." style="width:360px" oninput="loadMachines()">
+        <span id="machines-count" style="font-size:12px;color:var(--muted)"></span>
     </div>
     <table>
         <thead><tr><th>Nome</th><th>Local</th><th>Licença</th><th>Admin Pass</th><th>Token</th><th>Ações</th></tr></thead>
@@ -879,6 +923,21 @@ th { color: var(--muted); font-weight: 600; }
     </div>
 </div>
 
+<div class="modal" id="modal-genre-cover">
+    <div class="modal-box">
+        <h2 id="gc-title">Capa do gênero</h2>
+        <p style="color:var(--muted);font-size:13px;margin-bottom:10px">Você pode enviar um PNG sem fundo ou colar uma URL de imagem.</p>
+        <label>Enviar imagem PNG/JPG/WebP</label>
+        <input id="gc-file" type="file" accept="image/png,image/jpeg,image/webp">
+        <label>Ou URL da capa</label>
+        <input id="gc-url" placeholder="/genre_covers/sertanejo.png ou https://...">
+        <div class="row" style="margin-top:20px;justify-content:flex-end">
+            <button class="btn btn-ghost" onclick="closeModal('modal-genre-cover')">Cancelar</button>
+            <button class="btn" onclick="saveGenreCover()">Salvar capa</button>
+        </div>
+    </div>
+</div>
+
 <div class="modal" id="modal-dvd">
     <div class="modal-box">
         <h2>📀 Novo DVD</h2>
@@ -1011,6 +1070,17 @@ th { color: var(--muted); font-weight: 600; }
 </div>
 
 
+<div class="modal" id="modal-machine-reading">
+    <div class="modal-box" style="width:760px">
+        <h2>📖 Leitura da Máquina</h2>
+        <div id="machine-reading-content" style="font-size:13px;color:var(--text)">Carregando...</div>
+        <div class="row" style="margin-top:20px;justify-content:flex-end">
+            <button class="btn btn-ghost" onclick="closeModal('modal-machine-reading')">Fechar</button>
+        </div>
+    </div>
+</div>
+
+
 <script>
 const API = '';
 
@@ -1066,22 +1136,67 @@ async function loadStats() {
 
 // ─── MÁQUINAS ────────────────────────────────────────────────────────────────
 async function loadMachines() {
-    const d = await api('/admin/api/machines');
+    const q = document.getElementById('machine-search') ? document.getElementById('machine-search').value.trim() : '';
+    const d = await api('/admin/api/machines' + (q ? ('?q=' + encodeURIComponent(q)) : ''));
     const tb = document.getElementById('machines-tbody');
-    tb.innerHTML = d.machines.map(m => `
+    const machines = d.machines || [];
+    const countEl = document.getElementById('machines-count');
+    if (countEl) countEl.textContent = machines.length + ' máquina(s) encontrada(s)';
+    if (!machines.length) {
+        tb.innerHTML = '<tr><td colspan="6" style="color:var(--muted);padding:20px">Nenhuma máquina encontrada.</td></tr>';
+        return;
+    }
+    tb.innerHTML = machines.map(m => `
         <tr>
-            <td><strong>${m.name}</strong></td>
+            <td><strong>${m.name}</strong><br><span style="font-size:11px;color:var(--muted)">ID: ${m.id}</span></td>
             <td>${m.location || '-'}</td>
             <td><span class="badge ${m.license_ok ? 'green' : 'red'}">${m.license_ok ? 'Ativa' : 'Vencida'}</span></td>
             <td>${m.admin_pass || '1234'}</td>
             <td style="font-family:monospace;font-size:11px">${m.token.substring(0, 16)}...</td>
             <td>
+                <button class="btn btn-sm btn-ghost" onclick="showMachineReading('${m.id}')">📖 Leitura</button>
                 <button class="btn btn-sm btn-ghost" onclick="toggleLicense('${m.id}', ${m.license_ok})">${m.license_ok ? 'Bloquear' : 'Liberar'}</button>
                 <button class="btn btn-sm btn-ghost" onclick="copyToken('${m.token}')">📋</button>
                 <button class="btn btn-sm btn-ghost" onclick="resetMachinePass('${m.id}')">🔑</button>
             </td>
         </tr>
     `).join('');
+}
+
+async function showMachineReading(id) {
+    openModal('modal-machine-reading');
+    const box = document.getElementById('machine-reading-content');
+    box.innerHTML = 'Carregando leitura da máquina...';
+    const d = await api('/admin/api/machines/' + id + '/reading');
+    if (!d.ok) {
+        box.innerHTML = '<p style="color:var(--red)">' + (d.error || 'Erro ao carregar leitura.') + '</p>';
+        return;
+    }
+    const m = d.machine;
+    const plays = d.recent_plays || [];
+    const pays = d.recent_payments || [];
+    box.innerHTML = `
+        <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(160px,1fr));margin-bottom:16px">
+            <div class="stat"><div class="num">${d.totals.plays_today}</div><div class="lbl">Tocadas Hoje</div></div>
+            <div class="stat"><div class="num">${d.totals.plays_total}</div><div class="lbl">Tocadas Total</div></div>
+            <div class="stat"><div class="num">R$${Number(d.totals.revenue_month || 0).toFixed(2)}</div><div class="lbl">Receita Mês</div></div>
+            <div class="stat"><div class="num">R$${Number(d.totals.revenue_total || 0).toFixed(2)}</div><div class="lbl">Receita Total</div></div>
+        </div>
+        <div class="card" style="margin-bottom:12px">
+            <h3>${m.name}</h3>
+            <p><b>ID:</b> ${m.id} &nbsp; <b>Local:</b> ${m.location || '-'} &nbsp; <b>Licença:</b> ${m.license_ok ? 'Ativa' : 'Vencida'}</p>
+            <p><b>Vence em:</b> ${m.license_exp || '-'} &nbsp; <b>Senha admin:</b> ${m.admin_pass || '1234'}</p>
+            <p><b>Token:</b> <span style="font-family:monospace">${m.token}</span></p>
+        </div>
+        <h3 style="margin:12px 0 8px">Últimas músicas tocadas</h3>
+        <table><thead><tr><th>Data</th><th>Música</th><th>Artista</th><th>DVD</th></tr></thead><tbody>
+            ${plays.length ? plays.map(p => `<tr><td>${p.played_at}</td><td>${p.title || '-'}</td><td>${p.artist || '-'}</td><td>${p.dvd_name || '-'}</td></tr>`).join('') : '<tr><td colspan="4" style="color:var(--muted)">Nenhuma música registrada.</td></tr>'}
+        </tbody></table>
+        <h3 style="margin:16px 0 8px">Últimos pagamentos/créditos</h3>
+        <table><thead><tr><th>Data</th><th>Tipo</th><th>Valor</th><th>Créditos</th><th>Status</th></tr></thead><tbody>
+            ${pays.length ? pays.map(p => `<tr><td>${p.created_at}</td><td>${p.payment_type}</td><td>R$${Number(p.amount || 0).toFixed(2)}</td><td>${p.credits || 0}</td><td>${p.status}</td></tr>`).join('') : '<tr><td colspan="5" style="color:var(--muted)">Nenhum pagamento registrado.</td></tr>'}
+        </tbody></table>
+    `;
 }
 
 async function createMachine() {
@@ -1132,10 +1247,12 @@ async function loadGenres() {
     if (ycSel) ycSel.innerHTML = '<option value="">Selecione</option>';
 
     document.getElementById('genres-grid').innerHTML = d.genres.map(g => `
-        <div class="card">
+        <div class="card genre-card">
+            ${g.cover_url ? `<img class="genre-cover-img" src="${g.cover_url}" onerror="this.outerHTML='<div class=\'genre-cover-empty\'>🎸</div>'">` : `<div class="genre-cover-empty">🎸</div>`}
             <h3>🎸 ${g.name}</h3>
             <p>${g.dvd_count || 0} DVDs · ${g.song_count || 0} músicas</p>
             <div class="row" style="margin-top:12px">
+                <button class="btn btn-sm btn-ghost" onclick="openGenreCover(${g.id}, '${String(g.name).replace(/'/g, "\\'")}', '${String(g.cover_url || '').replace(/'/g, "\\'")}')">Adicionar capa</button>
                 <button class="btn btn-sm btn-ghost" onclick="deleteGenre(${g.id})">Excluir</button>
             </div>
         </div>
@@ -1158,6 +1275,36 @@ async function createGenre() {
     });
     if (r.ok) { closeModal('modal-genre'); loadGenres(); }
     else alert(r.error || 'Erro');
+}
+
+let editingGenreId = null;
+function openGenreCover(id, name, coverUrl) {
+    editingGenreId = id;
+    document.getElementById('gc-title').textContent = 'Capa do gênero: ' + name;
+    document.getElementById('gc-url').value = coverUrl || '';
+    document.getElementById('gc-file').value = '';
+    openModal('modal-genre-cover');
+}
+
+async function saveGenreCover() {
+    if (!editingGenreId) return;
+    const form = new FormData();
+    form.append('cover_url', document.getElementById('gc-url').value || '');
+    const file = document.getElementById('gc-file').files[0];
+    if (file) form.append('cover_file', file);
+
+    const r = await fetch('/admin/api/genres/' + editingGenreId + '/cover', {
+        method: 'POST',
+        body: form
+    });
+    const d = await r.json();
+    if (d.ok) {
+        closeModal('modal-genre-cover');
+        loadGenres();
+        alert('Capa salva! Ela já vai aparecer na máquina depois de reiniciar/conectar.');
+    } else {
+        alert(d.error || 'Erro ao salvar capa');
+    }
 }
 
 async function deleteGenre(id) {
@@ -1628,9 +1775,19 @@ def admin_machines():
             db.commit()
             return jsonify({"ok": True, "id": mid, "token": token})
 
-        machines = [dict(m) for m in db.execute(
-            "SELECT * FROM machines ORDER BY created_at DESC"
-        ).fetchall()]
+        q = (request.args.get("q") or "").strip()
+        if q:
+            like = f"%{q}%"
+            machines = [dict(m) for m in db.execute(
+                """SELECT * FROM machines
+                   WHERE name LIKE ? OR location LIKE ? OR id LIKE ? OR token LIKE ? OR admin_pass LIKE ?
+                   ORDER BY created_at DESC""",
+                (like, like, like, like, like)
+            ).fetchall()]
+        else:
+            machines = [dict(m) for m in db.execute(
+                "SELECT * FROM machines ORDER BY created_at DESC"
+            ).fetchall()]
         return jsonify({"machines": machines})
 
 
@@ -1656,6 +1813,68 @@ def admin_machine_reset_pass(mid):
         db.execute("UPDATE machines SET admin_pass=? WHERE id=?", (d.get("password", "1234"), mid))
         db.commit()
     return jsonify({"ok": True})
+
+
+@app.route("/admin/api/machines/<mid>/reading", methods=["GET"])
+def admin_machine_reading(mid):
+    """Leitura detalhada de uma máquina para acompanhamento no painel."""
+    err = require_admin()
+    if err: return err
+    current_month = datetime.now().strftime("%Y-%m")
+    today = datetime.now().strftime("%Y-%m-%d")
+    with get_db() as db:
+        m = db.execute("SELECT * FROM machines WHERE id=?", (mid,)).fetchone()
+        if not m:
+            return jsonify({"ok": False, "error": "Máquina não encontrada"}), 404
+
+        plays_today = db.execute(
+            "SELECT COUNT(*) FROM plays WHERE machine_id=? AND date(played_at)=?",
+            (mid, today)
+        ).fetchone()[0]
+        plays_total = db.execute(
+            "SELECT COUNT(*) FROM plays WHERE machine_id=?",
+            (mid,)
+        ).fetchone()[0]
+        revenue_total = db.execute(
+            "SELECT COALESCE(SUM(amount),0) FROM machine_revenue_log WHERE machine_id=?",
+            (mid,)
+        ).fetchone()[0] or 0
+        revenue_month = db.execute(
+            "SELECT COALESCE(SUM(amount),0) FROM machine_revenue_log WHERE machine_id=? AND strftime('%Y-%m', recorded_at)=?",
+            (mid, current_month)
+        ).fetchone()[0] or 0
+
+        recent_plays = [dict(r) for r in db.execute(
+            """SELECT pl.played_at, p.title, p.artist, d.name AS dvd_name
+               FROM plays pl
+               LEFT JOIN playlists p ON p.id = pl.playlist_id
+               LEFT JOIN dvds d ON d.id = p.dvd_id
+               WHERE pl.machine_id=?
+               ORDER BY pl.played_at DESC
+               LIMIT 20""",
+            (mid,)
+        ).fetchall()]
+        recent_payments = [dict(r) for r in db.execute(
+            """SELECT created_at, payment_type, amount, credits, status
+               FROM payments
+               WHERE machine_id=?
+               ORDER BY created_at DESC
+               LIMIT 20""",
+            (mid,)
+        ).fetchall()]
+
+        return jsonify({
+            "ok": True,
+            "machine": dict(m),
+            "totals": {
+                "plays_today": plays_today,
+                "plays_total": plays_total,
+                "revenue_total": float(revenue_total),
+                "revenue_month": float(revenue_month),
+            },
+            "recent_plays": recent_plays,
+            "recent_payments": recent_payments,
+        })
 
 
 @app.route("/admin/api/genres", methods=["GET", "POST"])
@@ -1684,6 +1903,33 @@ def admin_genres():
         """).fetchall():
             genres.append(dict(g))
         return jsonify({"genres": genres})
+
+
+@app.route("/admin/api/genres/<int:gid>/cover", methods=["POST"])
+def admin_genre_cover(gid):
+    err = require_admin()
+    if err: return err
+
+    cover_url = (request.form.get("cover_url") or "").strip()
+    file = request.files.get("cover_file")
+
+    if file and file.filename:
+        ext = Path(file.filename).suffix.lower()
+        if ext not in (".png", ".jpg", ".jpeg", ".webp"):
+            return jsonify({"ok": False, "error": "Use PNG, JPG ou WEBP"}), 400
+
+        safe_name = f"genre_{gid}_{uuid.uuid4().hex[:8]}{ext}"
+        target = GENRE_COVERS_DIR / safe_name
+        file.save(target)
+        cover_url = f"/genre_covers/{safe_name}"
+
+    if not cover_url:
+        return jsonify({"ok": False, "error": "Envie uma imagem ou informe uma URL"}), 400
+
+    with get_db() as db:
+        db.execute("UPDATE genres SET cover_url=? WHERE id=?", (cover_url, gid))
+        db.commit()
+    return jsonify({"ok": True, "cover_url": cover_url})
 
 
 @app.route("/admin/api/genres/<int:gid>", methods=["DELETE"])
