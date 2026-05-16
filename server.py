@@ -1,0 +1,2210 @@
+"""
+MajuBox — Servidor Central / Painel Admin
+Gerencia máquinas, DVDs, playlists, gêneros, licenças e pagamentos PIX
+Integração com API Mercado Pago para recebimento PIX
+"""
+import json, sqlite3, uuid, hashlib, os, threading, secrets, re
+from datetime import datetime, timedelta
+from pathlib import Path
+from flask import Flask, request, jsonify, render_template_string, redirect, url_for, session
+import urllib.request, urllib.error, urllib.parse
+
+app = Flask(__name__)
+app.secret_key = os.environ.get("MAJUBOX_SECRET", secrets.token_hex(32))
+
+DB_PATH = Path(__file__).parent / "majubox.db"
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "admin123")
+
+# ─── Mercado Pago ─────────────────────────────────────────────────────────────
+MP_ACCESS_TOKEN = os.environ.get("MP_ACCESS_TOKEN", "")
+PIX_CONFIG_PATH = Path(__file__).parent / "pix_config.json"
+YOUTUBE_CONFIG_PATH = Path(__file__).parent / "youtube_config.json"
+YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY", "")
+
+def _load_saved_youtube_key():
+    """Carrega a chave da API do YouTube salva no painel admin, se existir."""
+    global YOUTUBE_API_KEY
+    if YOUTUBE_API_KEY:
+        return
+    try:
+        if YOUTUBE_CONFIG_PATH.exists():
+            cfg = json.loads(YOUTUBE_CONFIG_PATH.read_text(encoding="utf-8"))
+            YOUTUBE_API_KEY = cfg.get("youtube_api_key", "") or ""
+    except Exception as e:
+        print(f"[YOUTUBE CONFIG] Nao consegui carregar chave YouTube: {e}")
+
+_load_saved_youtube_key()
+
+def _load_saved_mp_token():
+    """Carrega token salvo no painel admin, se existir."""
+    global MP_ACCESS_TOKEN
+    if MP_ACCESS_TOKEN:
+        return
+    try:
+        if PIX_CONFIG_PATH.exists():
+            cfg = json.loads(PIX_CONFIG_PATH.read_text(encoding="utf-8"))
+            MP_ACCESS_TOKEN = cfg.get("mp_token", "") or ""
+    except Exception as e:
+        print(f"[PIX CONFIG] Nao consegui carregar token Mercado Pago: {e}")
+
+_load_saved_mp_token()
+# Para Mercado Livre, usar:
+ML_ACCESS_TOKEN = os.environ.get("ML_ACCESS_TOKEN", "")
+ML_CLIENT_ID = os.environ.get("ML_CLIENT_ID", "")
+ML_CLIENT_SECRET = os.environ.get("ML_CLIENT_SECRET", "")
+
+# ─── Banco de dados ───────────────────────────────────────────────────────────
+def get_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    with get_db() as db:
+        db.executescript("""
+        CREATE TABLE IF NOT EXISTS machines (
+            id          TEXT PRIMARY KEY,
+            name        TEXT NOT NULL,
+            location    TEXT,
+            token       TEXT UNIQUE NOT NULL,
+            active      INTEGER DEFAULT 1,
+            license_ok  INTEGER DEFAULT 1,
+            license_exp TEXT,
+            admin_pass  TEXT DEFAULT '1234',
+            pix_key     TEXT,
+            pix_name    TEXT,
+            pix_city    TEXT,
+            created_at  TEXT DEFAULT (datetime('now'))
+        );
+
+        CREATE TABLE IF NOT EXISTS genres (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            name        TEXT NOT NULL,
+            cover_url   TEXT,
+            sort_order  INTEGER DEFAULT 0
+        );
+
+        CREATE TABLE IF NOT EXISTS dvds (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            genre_id    INTEGER REFERENCES genres(id) ON DELETE CASCADE,
+            name        TEXT NOT NULL,
+            cover_url   TEXT,
+            sort_order  INTEGER DEFAULT 0
+        );
+
+        CREATE TABLE IF NOT EXISTS playlists (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            genre_id     INTEGER REFERENCES genres(id) ON DELETE CASCADE,
+            dvd_id       INTEGER REFERENCES dvds(id) ON DELETE SET NULL,
+            title        TEXT NOT NULL,
+            artist       TEXT,
+            youtube_id   TEXT NOT NULL,
+            video_url    TEXT,
+            cover_url    TEXT,
+            mode         TEXT DEFAULT 'jukebox',
+            sort_order   INTEGER DEFAULT 0
+        );
+
+        CREATE TABLE IF NOT EXISTS payments (
+            id           TEXT PRIMARY KEY,
+            machine_id   TEXT REFERENCES machines(id),
+            amount       REAL DEFAULT 0,
+            credits      INTEGER DEFAULT 0,
+            status       TEXT DEFAULT 'pending',
+            pix_qr       TEXT,
+            pix_code     TEXT,
+            mp_id        TEXT,
+            payment_type TEXT DEFAULT 'license',
+            created_at   TEXT DEFAULT (datetime('now')),
+            paid_at      TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS plays (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            machine_id   TEXT,
+            playlist_id  INTEGER,
+            played_at    TEXT DEFAULT (datetime('now'))
+        );
+
+        CREATE TABLE IF NOT EXISTS license_revenue (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            machine_id   TEXT REFERENCES machines(id),
+            month        TEXT NOT NULL,
+            total        REAL DEFAULT 0,
+            created_at   TEXT DEFAULT (datetime('now'))
+        );
+
+        CREATE TABLE IF NOT EXISTS machine_revenue_log (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            machine_id   TEXT REFERENCES machines(id),
+            amount       REAL DEFAULT 0,
+            recorded_at  TEXT DEFAULT (datetime('now'))
+        );
+        """)
+
+        # Migração: versões antigas do banco podem não ter a coluna credited.
+        cols = [r[1] for r in db.execute("PRAGMA table_info(payments)").fetchall()]
+        if "credited" not in cols:
+            db.execute("ALTER TABLE payments ADD COLUMN credited INTEGER DEFAULT 0")
+
+        # Gêneros padrão
+        count = db.execute("SELECT COUNT(*) FROM genres").fetchone()[0]
+        if count == 0:
+            default_genres = [
+                ("Sertanejo", "", 0),
+                ("Pagode", "", 1),
+                ("Forró", "", 2),
+                ("Axé", "", 3),
+                ("Funk", "", 4),
+                ("Rock", "", 5),
+                ("Karaokê", "", 6),
+                ("MPB", "", 7),
+                ("Samba", "", 8),
+                ("Pop", "", 9),
+                ("Eletrônica", "", 10),
+                ("Gospel", "", 11),
+            ]
+            for name, cover, order in default_genres:
+                db.execute("INSERT INTO genres(name,cover_url,sort_order) VALUES(?,?,?)",
+                           (name, cover, order))
+
+        db.commit()
+
+init_db()
+
+# ─── Funções PIX (Mercado Pago) ───────────────────────────────────────────────
+def create_pix_payment(amount, description, machine_id):
+    """Cria pagamento PIX via API Mercado Pago"""
+    if not MP_ACCESS_TOKEN:
+        return {"qr_code": "", "pix_code": "", "mp_id": "", "error": "Token MP não configurado"}
+
+    try:
+        payment_id = str(uuid.uuid4())
+        headers = {
+            "Authorization": f"Bearer {MP_ACCESS_TOKEN}",
+            "Content-Type": "application/json",
+            "X-Idempotency-Key": payment_id
+        }
+        body = {
+            "transaction_amount": float(amount),
+            "description": description,
+            "payment_method_id": "pix",
+            "payer": {
+                "email": f"machine_{machine_id}@majubox.com"
+            }
+        }
+        data = json.dumps(body).encode()
+        req = urllib.request.Request(
+            "https://api.mercadopago.com/v1/payments",
+            data=data, headers=headers, method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=15) as r:
+            rd = json.loads(r.read())
+            mp_id = str(rd.get("id", ""))
+            pt = rd.get("point_of_interaction", {}).get("transaction_data", {})
+            qr_code = pt.get("qr_code_base64", "")
+            pix_code = pt.get("qr_code", "")
+            return {"qr_code": qr_code, "pix_code": pix_code, "mp_id": mp_id}
+    except Exception as e:
+        print(f"[PIX ERROR] {e}")
+        return {"qr_code": "", "pix_code": "", "mp_id": "", "error": str(e)}
+
+
+def check_pix_payment(mp_id):
+    """Verifica se pagamento PIX foi aprovado"""
+    if not MP_ACCESS_TOKEN or not mp_id:
+        return None
+    try:
+        headers = {"Authorization": f"Bearer {MP_ACCESS_TOKEN}"}
+        req = urllib.request.Request(
+            f"https://api.mercadopago.com/v1/payments/{mp_id}",
+            headers=headers
+        )
+        with urllib.request.urlopen(req, timeout=10) as r:
+            rd = json.loads(r.read())
+            return rd.get("status")  # approved, pending, rejected, etc.
+    except Exception as e:
+        print(f"[PIX CHECK ERROR] {e}")
+        return None
+
+
+# ─── API para as Máquinas ─────────────────────────────────────────────────────
+
+@app.route("/api/machine/check", methods=["POST"])
+def machine_check():
+    """Máquina verifica licença e recebe conteúdo"""
+    data = request.json or {}
+    token = data.get("token", "")
+
+    with get_db() as db:
+        m = db.execute("SELECT * FROM machines WHERE token=? AND active=1", (token,)).fetchone()
+        if not m:
+            return jsonify({"ok": False, "error": "Máquina não encontrada"}), 403
+
+        license_ok = bool(m["license_ok"])
+        license_exp = m["license_exp"]
+
+        if license_exp:
+            try:
+                exp = datetime.fromisoformat(license_exp)
+                if datetime.now() > exp:
+                    db.execute("UPDATE machines SET license_ok=0 WHERE id=?", (m["id"],))
+                    db.commit()
+                    license_ok = False
+            except:
+                pass
+
+        # Busca gêneros + playlists em formato que a máquina entende.
+        # IMPORTANTE: o app da máquina espera g["playlists"] como LISTA DE MÚSICAS,
+        # não como lista de DVDs. Por isso retornamos as músicas já com dvd_name/dvd_cover.
+        genres = [dict(g) for g in db.execute(
+            "SELECT * FROM genres ORDER BY sort_order"
+        ).fetchall()]
+
+        for g in genres:
+            songs = [dict(p) for p in db.execute("""
+                SELECT p.*, d.name AS dvd_name, d.cover_url AS dvd_cover
+                FROM playlists p
+                LEFT JOIN dvds d ON d.id = p.dvd_id
+                WHERE p.genre_id=?
+                ORDER BY COALESCE(d.sort_order, 0), p.sort_order, p.id
+            """, (g["id"],)).fetchall()]
+            g["playlists"] = songs
+
+        # PIX data
+        pix_data = None
+        if not license_ok:
+            pix_data = _get_or_create_license_pix(m["id"], db)
+
+        # PIX config da máquina (para tela de créditos PIX)
+        machine_pix = {
+            "pix_key": m["pix_key"] or "",
+            "pix_name": m["pix_name"] or "",
+            "pix_city": m["pix_city"] or "",
+        }
+
+        return jsonify({
+            "ok": True,
+            "license_ok": license_ok,
+            "machine_name": m["name"],
+            "machine_id": m["id"],
+            "genres": genres,
+            "pix": pix_data,
+            "machine_pix": machine_pix
+        })
+
+
+@app.route("/api/machine/play", methods=["POST"])
+def machine_play():
+    """Registra música tocada"""
+    data = request.json or {}
+    token = data.get("token", "")
+    with get_db() as db:
+        m = db.execute("SELECT id FROM machines WHERE token=?", (token,)).fetchone()
+        if m:
+            db.execute("INSERT INTO plays(machine_id,playlist_id) VALUES(?,?)",
+                       (m["id"], data.get("playlist_id")))
+            db.commit()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/machine/add_credits", methods=["POST"])
+def machine_add_credits():
+    """Máquina informa que recebeu créditos (via PIX ou dinheiro)"""
+    data = request.json or {}
+    token = data.get("token", "")
+    amount = data.get("amount", 0)
+    credits = data.get("credits", 0)
+
+    with get_db() as db:
+        m = db.execute("SELECT id FROM machines WHERE token=?", (token,)).fetchone()
+        if m:
+            db.execute(
+                "INSERT INTO machine_revenue_log(machine_id, amount) VALUES(?,?)",
+                (m["id"], amount)
+            )
+            db.commit()
+
+    return jsonify({"ok": True, "credits_added": credits})
+
+
+@app.route("/api/machine/pix/create", methods=["POST"])
+def machine_pix_create():
+    """Cria PIX Mercado Pago para comprar créditos da máquina."""
+    data = request.json or {}
+    token = data.get("token", "")
+    try:
+        amount = round(float(data.get("amount", 1.0)), 2)
+    except Exception:
+        amount = 1.0
+    amount = max(1.0, amount)
+    credits = int(data.get("credits") or round(amount * 2))
+    credits = max(1, credits)
+
+    if not MP_ACCESS_TOKEN:
+        return jsonify({
+            "ok": False,
+            "error": "Token Mercado Pago nao configurado. Configure MP_ACCESS_TOKEN no painel/servidor."
+        }), 400
+
+    with get_db() as db:
+        m = db.execute("SELECT * FROM machines WHERE token=? AND active=1", (token,)).fetchone()
+        if not m:
+            return jsonify({"ok": False, "error": "Maquina nao encontrada"}), 403
+
+        payment_id = str(uuid.uuid4())
+        pix = create_pix_payment(amount, f"MajuBox - {credits} creditos - {m['name']}", m["id"])
+        if pix.get("error") or not pix.get("mp_id"):
+            return jsonify({"ok": False, "error": pix.get("error", "Erro ao criar PIX no Mercado Pago")}), 400
+
+        db.execute(
+            "INSERT INTO payments(id,machine_id,amount,credits,status,pix_qr,pix_code,mp_id,payment_type,credited) VALUES(?,?,?,?,?,?,?,?,?,0)",
+            (payment_id, m["id"], amount, credits, "pending", pix["qr_code"], pix["pix_code"], pix["mp_id"], "credits")
+        )
+        db.commit()
+
+    return jsonify({
+        "ok": True,
+        "payment_id": payment_id,
+        "mp_id": pix["mp_id"],
+        "amount": amount,
+        "credits": credits,
+        "qr_code": pix["qr_code"],
+        "pix_code": pix["pix_code"],
+        "status": "pending"
+    })
+
+
+@app.route("/api/machine/pix/status", methods=["POST"])
+def machine_pix_status():
+    """Consulta PIX no Mercado Pago. Quando aprovado, libera crédito uma única vez."""
+    data = request.json or {}
+    token = data.get("token", "")
+    payment_id = data.get("payment_id", "")
+
+    with get_db() as db:
+        m = db.execute("SELECT * FROM machines WHERE token=? AND active=1", (token,)).fetchone()
+        if not m:
+            return jsonify({"ok": False, "error": "Maquina nao encontrada"}), 403
+
+        payment = db.execute(
+            "SELECT * FROM payments WHERE id=? AND machine_id=? AND payment_type='credits'",
+            (payment_id, m["id"])
+        ).fetchone()
+        if not payment:
+            return jsonify({"ok": False, "error": "Pagamento nao encontrado"}), 404
+
+        mp_status = check_pix_payment(payment["mp_id"]) or payment["status"] or "pending"
+        credits_added = 0
+
+        if mp_status == "approved":
+            if not payment["credited"]:
+                credits_added = int(payment["credits"] or 0)
+                db.execute(
+                    "UPDATE payments SET status='credited', credited=1, paid_at=datetime('now') WHERE id=?",
+                    (payment_id,)
+                )
+                db.execute(
+                    "INSERT INTO machine_revenue_log(machine_id, amount) VALUES(?,?)",
+                    (m["id"], float(payment["amount"] or 0))
+                )
+                db.commit()
+                return jsonify({
+                    "ok": True,
+                    "status": "approved",
+                    "credited": True,
+                    "credits_added": credits_added,
+                    "amount": float(payment["amount"] or 0)
+                })
+            return jsonify({
+                "ok": True,
+                "status": "approved",
+                "credited": True,
+                "credits_added": 0,
+                "amount": float(payment["amount"] or 0)
+            })
+
+        if mp_status in ("rejected", "cancelled", "refunded", "charged_back"):
+            db.execute("UPDATE payments SET status=? WHERE id=?", (mp_status, payment_id))
+            db.commit()
+
+        return jsonify({
+            "ok": True,
+            "status": mp_status,
+            "credited": bool(payment["credited"]),
+            "credits_added": 0,
+            "amount": float(payment["amount"] or 0)
+        })
+
+
+@app.route("/api/pix/webhook", methods=["POST"])
+def pix_webhook():
+    """Webhook Mercado Pago — confirma pagamento PIX"""
+    data = request.json or {}
+    mp_id = str(data.get("data", {}).get("id", ""))
+
+    if not mp_id:
+        # Formato alternativo do MP
+        mp_id = str(data.get("id", ""))
+
+    if not mp_id:
+        return jsonify({"ok": False}), 400
+
+    status = check_pix_payment(mp_id)
+    if status != "approved":
+        return jsonify({"ok": True, "status": status})
+
+    with get_db() as db:
+        payment = db.execute("SELECT * FROM payments WHERE mp_id=?", (mp_id,)).fetchone()
+        if payment and payment["status"] != "paid":
+            db.execute("UPDATE payments SET status='paid', paid_at=datetime('now') WHERE mp_id=?",
+                       (mp_id,))
+
+            if payment["payment_type"] == "credits":
+                # A máquina libera os créditos pelo endpoint /api/machine/pix/status.
+                # O webhook apenas marca como pago para acelerar a confirmação.
+                db.execute("UPDATE payments SET status='paid', paid_at=datetime('now') WHERE mp_id=?", (mp_id,))
+
+            if payment["payment_type"] == "license":
+                new_exp = (datetime.now() + timedelta(days=30)).isoformat()
+                db.execute("UPDATE machines SET license_ok=1, license_exp=? WHERE id=?",
+                           (new_exp, payment["machine_id"]))
+
+                # Registra receita da licença
+                month = datetime.now().strftime("%Y-%m")
+                existing = db.execute(
+                    "SELECT id FROM license_revenue WHERE machine_id=? AND month=?",
+                    (payment["machine_id"], month)
+                ).fetchone()
+                if existing:
+                    db.execute("UPDATE license_revenue SET total=total+? WHERE id=?",
+                               (payment["amount"], existing["id"]))
+                else:
+                    db.execute("INSERT INTO license_revenue(machine_id,month,total) VALUES(?,?,?)",
+                               (payment["machine_id"], month, payment["amount"]))
+
+            db.commit()
+
+    return jsonify({"ok": True, "status": "paid"})
+
+
+def _get_or_create_license_pix(machine_id, db):
+    """Cria ou recupera PIX pendente para renovação de licença"""
+    existing = db.execute(
+        "SELECT * FROM payments WHERE machine_id=? AND status='pending' AND payment_type='license'",
+        (machine_id,)
+    ).fetchone()
+    if existing:
+        return {"qr_code": existing["pix_qr"], "pix_code": existing["pix_code"]}
+
+    payment_id = str(uuid.uuid4())
+    pix = create_pix_payment(10.0, f"MajuBox - Renovação Licença {machine_id[:8]}", machine_id)
+
+    db.execute(
+        "INSERT INTO payments(id,machine_id,amount,pix_qr,pix_code,mp_id,payment_type) VALUES(?,?,?,?,?,?,?)",
+        (payment_id, machine_id, 10.0, pix["qr_code"], pix["pix_code"], pix["mp_id"], "license")
+    )
+    db.commit()
+    return {"qr_code": pix["qr_code"], "pix_code": pix["pix_code"]}
+
+
+# ─── Painel Admin ─────────────────────────────────────────────────────────────
+
+ADMIN_HTML = """<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MajuBox — Painel Admin</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+:root {
+    --bg: #0a0a0f;
+    --card: #13131a;
+    --border: #1e1e2e;
+    --accent: #e50914;
+    --text: #eee;
+    --muted: #666;
+    --green: #2ecc71;
+    --yellow: #f1c40f;
+    --red: #e74c3c;
+}
+body { background: var(--bg); color: var(--text); font-family: 'Segoe UI', sans-serif; min-height: 100vh; }
+
+header {
+    background: var(--card);
+    border-bottom: 1px solid var(--border);
+    padding: 16px 24px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    position: sticky;
+    top: 0;
+    z-index: 50;
+}
+header h1 { font-size: 20px; color: var(--accent); }
+header span { color: var(--muted); font-size: 13px; }
+
+.wrap { max-width: 1200px; margin: 0 auto; padding: 24px; }
+
+.tabs {
+    display: flex;
+    gap: 4px;
+    margin-bottom: 24px;
+    border-bottom: 1px solid var(--border);
+    overflow-x: auto;
+}
+.tab {
+    padding: 10px 18px;
+    cursor: pointer;
+    border: none;
+    background: none;
+    color: var(--muted);
+    font-size: 13px;
+    border-bottom: 2px solid transparent;
+    transition: .2s;
+    white-space: nowrap;
+}
+.tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+
+.pane { display: none; }
+.pane.active { display: block; }
+
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 16px; }
+
+.card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 16px;
+    transition: .2s;
+}
+.card:hover { border-color: var(--accent); }
+.card h3 { font-size: 15px; margin-bottom: 8px; }
+.card p { font-size: 13px; color: var(--muted); }
+
+.badge {
+    display: inline-block;
+    padding: 3px 10px;
+    border-radius: 999px;
+    font-size: 11px;
+    font-weight: 700;
+}
+.badge.green { background: #0d2e1a; color: var(--green); }
+.badge.red { background: #2e0d0d; color: var(--red); }
+.badge.yellow { background: #2e2a0d; color: var(--yellow); }
+.badge.blue { background: #0d1a2e; color: #3498db; }
+
+.btn, button {
+    background: var(--accent);
+    color: #fff;
+    border: none;
+    padding: 8px 16px;
+    border-radius: 8px;
+    cursor: pointer;
+    font-size: 13px;
+    transition: .2s;
+}
+.btn:hover { opacity: 0.9; }
+.btn-ghost { background: transparent; border: 1px solid var(--border); color: var(--text); }
+.btn-green { background: #0d5c2e; }
+.btn-red { background: #5c0d0d; }
+.btn-sm { font-size: 11px; padding: 4px 10px; }
+
+input, select, textarea {
+    background: #1a1a24;
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 8px 12px;
+    border-radius: 8px;
+    font-size: 13px;
+    width: 100%;
+}
+label { font-size: 12px; color: var(--muted); display: block; margin-bottom: 4px; margin-top: 12px; }
+
+.row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+
+table { width: 100%; border-collapse: collapse; }
+th, td { padding: 10px 12px; text-align: left; border-bottom: 1px solid var(--border); font-size: 13px; }
+th { color: var(--muted); font-weight: 600; }
+
+.stat {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 20px;
+    text-align: center;
+}
+.stat .num { font-size: 32px; font-weight: 700; color: var(--accent); }
+.stat .lbl { font-size: 12px; color: var(--muted); margin-top: 4px; }
+
+.stats-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 16px;
+    margin-bottom: 24px;
+}
+
+.playlist-item {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 10px;
+    border-bottom: 1px solid var(--border);
+}
+.playlist-item img {
+    width: 48px;
+    height: 48px;
+    object-fit: cover;
+    border-radius: 6px;
+    background: #222;
+}
+
+.modal {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.8);
+    z-index: 100;
+    align-items: center;
+    justify-content: center;
+}
+.modal.open { display: flex; }
+
+.modal-box {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    padding: 24px;
+    width: 520px;
+    max-width: 95vw;
+    max-height: 90vh;
+    overflow-y: auto;
+}
+.modal-box h2 { margin-bottom: 16px; font-size: 18px; }
+
+.dvd-card {
+    display: flex;
+    gap: 12px;
+    padding: 12px;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    margin-bottom: 8px;
+    align-items: center;
+}
+.dvd-card img { width: 60px; height: 60px; border-radius: 8px; object-fit: cover; background: #222; }
+
+.revenue-reset {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 20px;
+    margin-top: 16px;
+}
+
+@media (max-width: 700px) {
+    .stats-grid { grid-template-columns: 1fr 1fr; }
+    .tabs { flex-wrap: nowrap; }
+}
+</style>
+</head>
+<body>
+
+<header>
+    <div style="font-size:24px">🎵</div>
+    <div><h1>MajuBox</h1><span>Painel Administrativo</span></div>
+    <div style="margin-left:auto">
+        <a href="/admin/logout" style="color:var(--muted);font-size:13px;text-decoration:none">Sair</a>
+    </div>
+</header>
+
+<div class="wrap">
+
+<!-- ESTATÍSTICAS -->
+<div class="stats-grid" id="stats">
+    <div class="stat"><div class="num" id="s-machines">-</div><div class="lbl">Máquinas Ativas</div></div>
+    <div class="stat"><div class="num" id="s-plays">-</div><div class="lbl">Músicas Tocadas (Hoje)</div></div>
+    <div class="stat"><div class="num" id="s-revenue">-</div><div class="lbl">Receita Licenças (Mês)</div></div>
+    <div class="stat"><div class="num" id="s-dvds">-</div><div class="lbl">DVDs Cadastrados</div></div>
+</div>
+
+<!-- ABAS -->
+<div class="tabs">
+    <button class="tab active" onclick="showTab('machines')">🖥️ Máquinas</button>
+    <button class="tab" onclick="showTab('genres')">🎸 Gêneros</button>
+    <button class="tab" onclick="showTab('dvds')">📀 DVDs</button>
+    <button class="tab" onclick="showTab('playlists')">🎵 Músicas</button>
+    <button class="tab" onclick="showTab('payments')">💰 Pagamentos</button>
+    <button class="tab" onclick="showTab('revenue')">📊 Faturamento</button>
+    <button class="tab" onclick="showTab('pix')">💳 PIX</button>
+</div>
+
+<!-- MÁQUINAS -->
+<div id="pane-machines" class="pane active">
+    <div class="row" style="margin-bottom:16px">
+        <button class="btn" onclick="openModal('modal-machine')">+ Nova Máquina</button>
+    </div>
+    <table>
+        <thead><tr><th>Nome</th><th>Local</th><th>Licença</th><th>Admin Pass</th><th>Token</th><th>Ações</th></tr></thead>
+        <tbody id="machines-tbody"></tbody>
+    </table>
+</div>
+
+<!-- GÊNEROS -->
+<div id="pane-genres" class="pane">
+    <div class="row" style="margin-bottom:16px">
+        <button class="btn" onclick="openModal('modal-genre')">+ Novo Gênero</button>
+    </div>
+    <div class="grid" id="genres-grid"></div>
+</div>
+
+<!-- DVDs -->
+<div id="pane-dvds" class="pane">
+    <div class="row" style="margin-bottom:16px">
+        <select id="dvd-genre-filter" onchange="loadDVDs()" style="width:200px">
+            <option value="">Todos os gêneros</option>
+        </select>
+        <button class="btn" onclick="openModal('modal-dvd')">+ Novo DVD</button>
+    </div>
+    <div id="dvds-list"></div>
+</div>
+
+<!-- PLAYLISTS -->
+<div id="pane-playlists" class="pane">
+    <div class="row" style="margin-bottom:16px">
+        <select id="filter-genre" onchange="loadPlaylists()" style="width:180px">
+            <option value="">Todos os gêneros</option>
+        </select>
+        <select id="filter-dvd" onchange="loadPlaylists()" style="width:180px">
+            <option value="">Todos os DVDs</option>
+        </select>
+        <button class="btn" onclick="openModal('modal-playlist')">+ Adicionar Música</button>
+        <button class="btn btn-ghost" onclick="openModal('modal-bulk-playlist')">📋 Adicionar lista do DVD</button>
+        <button class="btn btn-ghost" onclick="openModal('modal-youtube-channel')">📺 Importar canal YouTube</button>
+    </div>
+    <div id="playlists-list"></div>
+</div>
+
+<!-- PAGAMENTOS -->
+<div id="pane-payments" class="pane">
+    <table>
+        <thead><tr><th>Máquina</th><th>Tipo</th><th>Valor</th><th>Créditos</th><th>Status</th><th>Data</th><th>Ações</th></tr></thead>
+        <tbody id="payments-tbody"></tbody>
+    </table>
+</div>
+
+<!-- FATURAMENTO -->
+<div id="pane-revenue" class="pane">
+    <h2 style="margin-bottom:16px">📊 Faturamento por Licença</h2>
+    <div class="row" style="margin-bottom:16px">
+        <select id="revenue-month" onchange="loadRevenue()" style="width:180px">
+        </select>
+        <button class="btn" onclick="loadRevenue()">Atualizar</button>
+    </div>
+    <table>
+        <thead><tr><th>Máquina</th><th>Mês</th><th>Total (R$)</th></tr></thead>
+        <tbody id="revenue-tbody"></tbody>
+    </table>
+    <div class="revenue-reset">
+        <h3 style="margin-bottom:12px">Zerar Contadores</h3>
+        <p style="color:var(--muted);font-size:13px;margin-bottom:12px">
+            Zera o registro de faturamento do mês selecionado. Use para iniciar nova contagem mensal.
+        </p>
+        <div class="row">
+            <select id="reset-month" style="width:180px"></select>
+            <button class="btn btn-red" onclick="resetRevenue()">🗑️ Zerar Mês</button>
+        </div>
+    </div>
+</div>
+
+<!-- PIX -->
+<div id="pane-pix" class="pane">
+    <h2 style="margin-bottom:16px">💳 Configuração PIX</h2>
+    <div class="card" style="max-width:500px">
+        <p style="margin-bottom:16px;color:var(--muted)">
+            Configure as informações PIX que aparecerão nas máquinas para recebimento de créditos.
+            Os pagamentos são processados via Mercado Pago.
+        </p>
+        <label>Chave PIX (CPF/CNPJ/Email/Telefone)</label>
+        <input id="pix-key" placeholder="Ex: 123.456.789-00">
+        <label>Nome do Recebedor</label>
+        <input id="pix-name" placeholder="Seu nome ou empresa">
+        <label>Cidade</label>
+        <input id="pix-city" placeholder="Sua cidade">
+        <label>Token Mercado Pago</label>
+        <input id="mp-token" type="password" placeholder="APP_USR-...">
+        <hr style="border:0;border-top:1px solid var(--border);margin:18px 0">
+        <h3 style="font-size:15px;margin-bottom:6px">📺 YouTube API</h3>
+        <p style="color:var(--muted);font-size:12px;margin-bottom:8px">Cole sua chave da YouTube Data API para importar canais automaticamente.</p>
+        <label>Chave YouTube API</label>
+        <input id="youtube-api-key" type="password" placeholder="AIza...">
+        <div class="row" style="margin-top:20px;justify-content:flex-end">
+            <button class="btn" onclick="savePixConfig()">💾 Salvar</button>
+        </div>
+    </div>
+    <div id="pix-status" style="margin-top:16px"></div>
+</div>
+
+</div>
+
+<!-- ═══ MODAIS ═══ -->
+
+<div class="modal" id="modal-machine">
+    <div class="modal-box">
+        <h2>🖥️ Nova Máquina</h2>
+        <label>Nome da Máquina</label>
+        <input id="m-name" placeholder="Ex: MajuBox Bar do João">
+        <label>Local / Endereço</label>
+        <input id="m-location" placeholder="Ex: Rua das Flores, 123">
+        <label>Senha Admin (para faturamento/PIX na máquina)</label>
+        <input id="m-pass" placeholder="Ex: 1234" value="1234">
+        <div class="row" style="margin-top:20px;justify-content:flex-end">
+            <button class="btn btn-ghost" onclick="closeModal('modal-machine')">Cancelar</button>
+            <button class="btn" onclick="createMachine()">Criar</button>
+        </div>
+    </div>
+</div>
+
+<div class="modal" id="modal-genre">
+    <div class="modal-box">
+        <h2>🎸 Novo Gênero</h2>
+        <label>Nome do Gênero</label>
+        <input id="g-name" placeholder="Ex: Sertanejo">
+        <label>URL da Capa (opcional)</label>
+        <input id="g-cover" placeholder="https://...">
+        <div class="row" style="margin-top:20px;justify-content:flex-end">
+            <button class="btn btn-ghost" onclick="closeModal('modal-genre')">Cancelar</button>
+            <button class="btn" onclick="createGenre()">Criar</button>
+        </div>
+    </div>
+</div>
+
+<div class="modal" id="modal-dvd">
+    <div class="modal-box">
+        <h2>📀 Novo DVD</h2>
+        <label>Gênero</label>
+        <select id="d-genre"></select>
+        <label>Nome do DVD</label>
+        <input id="d-name" placeholder="Ex: Sertanejo 2024">
+        <label>URL da Capa do DVD</label>
+        <input id="d-cover" placeholder="https://...">
+        <div class="row" style="margin-top:20px;justify-content:flex-end">
+            <button class="btn btn-ghost" onclick="closeModal('modal-dvd')">Cancelar</button>
+            <button class="btn" onclick="createDVD()">Criar</button>
+        </div>
+    </div>
+</div>
+
+<div class="modal" id="modal-playlist">
+    <div class="modal-box">
+        <h2>🎵 Adicionar Música</h2>
+        <label>Gênero</label>
+        <select id="p-genre" onchange="updateDVDSelect()"></select>
+        <label>DVD</label>
+        <select id="p-dvd"><option value="">Sem DVD (genérico)</option></select>
+        <label>Título da Música</label>
+        <input id="p-title" placeholder="Nome da música">
+        <label>Artista</label>
+        <input id="p-artist" placeholder="Nome do artista">
+        <label>ID do YouTube (ex: dQw4w9WgXcQ)</label>
+        <input id="p-ytid" placeholder="Cole apenas o ID do vídeo">
+        <label>URL do Vídeo (alternativa ao YouTube)</label>
+        <input id="p-vidurl" placeholder="https://...">
+        <label>Modo</label>
+        <select id="p-mode">
+            <option value="jukebox">Jukebox</option>
+            <option value="karaoke">Karaokê</option>
+        </select>
+        <div class="row" style="margin-top:20px;justify-content:flex-end">
+            <button class="btn btn-ghost" onclick="closeModal('modal-playlist')">Cancelar</button>
+            <button class="btn" onclick="createPlaylist()">Adicionar</button>
+        </div>
+    </div>
+</div>
+
+<div class="modal" id="modal-edit-playlist">
+    <div class="modal-box">
+        <h2>✏️ Editar Música</h2>
+        <input id="e-id" type="hidden">
+        <label>Título da Música</label>
+        <input id="e-title" placeholder="Nome da música">
+        <label>Artista</label>
+        <input id="e-artist" placeholder="Nome do artista">
+        <label>ID do YouTube salvo</label>
+        <input id="e-ytid" placeholder="Ex: dQw4w9WgXcQ">
+        <label>URL do Vídeo (opcional)</label>
+        <input id="e-vidurl" placeholder="https://www.youtube.com/watch?v=...">
+        <label>Modo</label>
+        <select id="e-mode">
+            <option value="jukebox">Jukebox</option>
+            <option value="karaoke">Karaokê</option>
+        </select>
+        <div style="color:var(--muted);font-size:12px;margin-top:10px">
+            Use este campo para corrigir o ID quando o vídeo der erro, mudar de link ou trocar a música.
+        </div>
+        <div class="row" style="margin-top:20px;justify-content:flex-end">
+            <button class="btn btn-ghost" onclick="closeModal('modal-edit-playlist')">Cancelar</button>
+            <button class="btn" onclick="saveEditedPlaylist()">Salvar alteração</button>
+        </div>
+    </div>
+</div>
+
+<div class="modal" id="modal-bulk-playlist">
+    <div class="modal-box">
+        <h2>📋 Adicionar lista do DVD</h2>
+        <p style="color:var(--muted);font-size:13px;margin-bottom:12px">
+            Cole várias músicas de uma vez. Aceita formato de tabela, exemplo:<br>
+            <code>| Tubarões | `10XarNSkw0s` |</code>
+        </p>
+        <label>Gênero</label>
+        <select id="b-genre" onchange="updateBulkDVDSelect()"></select>
+        <label>DVD</label>
+        <select id="b-dvd"><option value="">Sem DVD (genérico)</option></select>
+        <label>Artista padrão</label>
+        <input id="b-artist" placeholder="Ex: Diego e Victor Hugo">
+        <label>Modo</label>
+        <select id="b-mode">
+            <option value="jukebox">Jukebox</option>
+            <option value="karaoke">Karaokê</option>
+        </select>
+        <label>Lista de músicas</label>
+        <textarea id="b-list" rows="12" placeholder="| Tubarões | `10XarNSkw0s` |
+| Facas | `VntVkQRaAS8` |
+| Desbloqueado | `eJO62WkGzcU` |"></textarea>
+        <div id="bulk-result" style="color:var(--muted);font-size:13px;margin-top:10px"></div>
+        <div class="row" style="margin-top:20px;justify-content:flex-end">
+            <button class="btn btn-ghost" onclick="closeModal('modal-bulk-playlist')">Cancelar</button>
+            <button class="btn" onclick="bulkCreatePlaylists()">Adicionar lista</button>
+        </div>
+    </div>
+</div>
+
+<div class="modal" id="modal-youtube-channel">
+    <div class="modal-box">
+        <h2>📺 Importar canal do YouTube</h2>
+        <p style="color:var(--muted);font-size:13px;margin-bottom:12px">
+            Cole o link do canal. O servidor pega os vídeos, descarta os maiores que 7 minutos e cria as músicas automaticamente.
+        </p>
+        <label>Gênero</label>
+        <select id="yc-genre"></select>
+        <label>Link do canal ou @handle</label>
+        <input id="yc-channel-url" placeholder="Ex: https://www.youtube.com/@DiegoeVictorHugo">
+        <label>Nome do DVD (opcional)</label>
+        <input id="yc-dvd-name" placeholder="Se vazio, usa o nome do canal">
+        <label>Artista padrão (opcional)</label>
+        <input id="yc-artist" placeholder="Se vazio, usa o nome do canal">
+        <label>Limite de duração em minutos</label>
+        <input id="yc-max-minutes" type="number" min="1" max="30" value="7">
+        <label>Quantidade máxima de vídeos</label>
+        <input id="yc-max-results" type="number" min="1" max="500" value="50">
+        <label>Modo</label>
+        <select id="yc-mode">
+            <option value="jukebox">Jukebox</option>
+            <option value="karaoke">Karaokê</option>
+        </select>
+        <div id="yc-result" style="color:var(--muted);font-size:13px;margin-top:10px"></div>
+        <div class="row" style="margin-top:20px;justify-content:flex-end">
+            <button class="btn btn-ghost" onclick="closeModal('modal-youtube-channel')">Cancelar</button>
+            <button class="btn" onclick="importYouTubeChannel()">Importar canal</button>
+        </div>
+    </div>
+</div>
+
+
+<script>
+const API = '';
+
+async function api(path, method = 'GET', body = null) {
+    const opts = {
+        method,
+        headers: { 'Content-Type': 'application/json' },
+        body: body ? JSON.stringify(body) : null
+    };
+    const r = await fetch(API + path, opts);
+    let data = {};
+    try { data = await r.json(); } catch (e) { data = {}; }
+    if (!r.ok && !data.error) {
+        data.error = 'Erro HTTP ' + r.status + ' em ' + path;
+    }
+    return data;
+}
+
+function showTab(t) {
+    const tabs = { machines: 0, genres: 1, dvds: 2, playlists: 3, payments: 4, revenue: 5, pix: 6 };
+    document.querySelectorAll('.tab').forEach((b, i) => b.classList.toggle('active', i === tabs[t]));
+    document.querySelectorAll('.pane').forEach(p => p.classList.remove('active'));
+    document.getElementById('pane-' + t).classList.add('active');
+
+    if (t === 'machines') loadMachines();
+    if (t === 'genres') loadGenres();
+    if (t === 'dvds') loadDVDs();
+    if (t === 'playlists') loadPlaylists();
+    if (t === 'payments') loadPayments();
+    if (t === 'revenue') loadRevenue();
+    if (t === 'pix') loadPixConfig();
+}
+
+function openModal(id) {
+    // Garante que os selects de gênero/DVD estejam carregados antes de abrir modais
+    if (id === 'modal-youtube-channel' || id === 'modal-bulk-playlist' || id === 'modal-playlist' || id === 'modal-dvd') {
+        loadGenres();
+        loadDVDs();
+    }
+    const el = document.getElementById(id);
+    if (el) el.classList.add('open');
+}
+function closeModal(id) { document.getElementById(id).classList.remove('open'); }
+
+// ─── ESTATÍSTICAS ────────────────────────────────────────────────────────────
+async function loadStats() {
+    const d = await api('/admin/api/stats');
+    document.getElementById('s-machines').textContent = d.machines || 0;
+    document.getElementById('s-plays').textContent = d.plays || 0;
+    document.getElementById('s-revenue').textContent = 'R$' + (d.revenue || 0).toFixed(0);
+    document.getElementById('s-dvds').textContent = d.dvds || 0;
+}
+
+// ─── MÁQUINAS ────────────────────────────────────────────────────────────────
+async function loadMachines() {
+    const d = await api('/admin/api/machines');
+    const tb = document.getElementById('machines-tbody');
+    tb.innerHTML = d.machines.map(m => `
+        <tr>
+            <td><strong>${m.name}</strong></td>
+            <td>${m.location || '-'}</td>
+            <td><span class="badge ${m.license_ok ? 'green' : 'red'}">${m.license_ok ? 'Ativa' : 'Vencida'}</span></td>
+            <td>${m.admin_pass || '1234'}</td>
+            <td style="font-family:monospace;font-size:11px">${m.token.substring(0, 16)}...</td>
+            <td>
+                <button class="btn btn-sm btn-ghost" onclick="toggleLicense('${m.id}', ${m.license_ok})">${m.license_ok ? 'Bloquear' : 'Liberar'}</button>
+                <button class="btn btn-sm btn-ghost" onclick="copyToken('${m.token}')">📋</button>
+                <button class="btn btn-sm btn-ghost" onclick="resetMachinePass('${m.id}')">🔑</button>
+            </td>
+        </tr>
+    `).join('');
+}
+
+async function createMachine() {
+    const r = await api('/admin/api/machines', 'POST', {
+        name: document.getElementById('m-name').value,
+        location: document.getElementById('m-location').value,
+        admin_pass: document.getElementById('m-pass').value || '1234'
+    });
+    if (r.ok) {
+        closeModal('modal-machine');
+        loadMachines();
+        loadStats();
+    } else alert(r.error || 'Erro ao criar');
+}
+
+async function toggleLicense(id, cur) {
+    await api('/admin/api/machines/' + id + '/license', 'POST', { active: !cur });
+    loadMachines();
+}
+
+async function resetMachinePass(id) {
+    const pass = prompt('Nova senha admin para a máquina:', '1234');
+    if (pass) {
+        await api('/admin/api/machines/' + id + '/reset_pass', 'POST', { password: pass });
+        loadMachines();
+    }
+}
+
+function copyToken(t) {
+    navigator.clipboard.writeText(t).then(() => alert('Token copiado! Cole no config da máquina.'));
+}
+
+// ─── GÊNEROS ─────────────────────────────────────────────────────────────────
+async function loadGenres() {
+    const d = await api('/admin/api/genres');
+    const sel = document.getElementById('p-genre');
+    const dvdSel = document.getElementById('d-genre');
+    const flt = document.getElementById('filter-genre');
+    const dvdFlt = document.getElementById('dvd-genre-filter');
+    const bulkSel = document.getElementById('b-genre');
+    const ycSel = document.getElementById('yc-genre');
+
+    sel.innerHTML = '<option value="">Selecione</option>';
+    dvdSel.innerHTML = '<option value="">Selecione</option>';
+    flt.innerHTML = '<option value="">Todos os gêneros</option>';
+    dvdFlt.innerHTML = '<option value="">Todos os gêneros</option>';
+    if (bulkSel) bulkSel.innerHTML = '<option value="">Selecione</option>';
+    if (ycSel) ycSel.innerHTML = '<option value="">Selecione</option>';
+
+    document.getElementById('genres-grid').innerHTML = d.genres.map(g => `
+        <div class="card">
+            <h3>🎸 ${g.name}</h3>
+            <p>${g.dvd_count || 0} DVDs · ${g.song_count || 0} músicas</p>
+            <div class="row" style="margin-top:12px">
+                <button class="btn btn-sm btn-ghost" onclick="deleteGenre(${g.id})">Excluir</button>
+            </div>
+        </div>
+    `).join('');
+
+    d.genres.forEach(g => {
+        sel.innerHTML += `<option value="${g.id}">${g.name}</option>`;
+        dvdSel.innerHTML += `<option value="${g.id}">${g.name}</option>`;
+        flt.innerHTML += `<option value="${g.id}">${g.name}</option>`;
+        dvdFlt.innerHTML += `<option value="${g.id}">${g.name}</option>`;
+        if (bulkSel) bulkSel.innerHTML += `<option value="${g.id}">${g.name}</option>`;
+        if (ycSel) ycSel.innerHTML += `<option value="${g.id}">${g.name}</option>`;
+    });
+}
+
+async function createGenre() {
+    const r = await api('/admin/api/genres', 'POST', {
+        name: document.getElementById('g-name').value,
+        cover_url: document.getElementById('g-cover').value
+    });
+    if (r.ok) { closeModal('modal-genre'); loadGenres(); }
+    else alert(r.error || 'Erro');
+}
+
+async function deleteGenre(id) {
+    if (confirm('Excluir gênero e TODOS os DVDs e músicas?')) {
+        await api('/admin/api/genres/' + id, 'DELETE');
+        loadGenres();
+    }
+}
+
+// ─── DVDs ────────────────────────────────────────────────────────────────────
+async function loadDVDs() {
+    const gid = document.getElementById('dvd-genre-filter').value;
+    const d = await api('/admin/api/dvds' + (gid ? '?genre_id=' + gid : ''));
+    const filterDvd = document.getElementById('filter-dvd');
+    filterDvd.innerHTML = '<option value="">Todos os DVDs</option>';
+
+    document.getElementById('dvds-list').innerHTML = d.dvds.map(dv => `
+        <div class="dvd-card">
+            <img src="${dv.cover_url || ''}" onerror="this.style.background='#333'">
+            <div style="flex:1">
+                <div style="font-weight:600">📀 ${dv.name}</div>
+                <div style="font-size:12px;color:var(--muted)">${dv.genre_name || ''} · ${dv.song_count || 0} músicas</div>
+            </div>
+            <button class="btn btn-sm btn-ghost" onclick="deleteDVD(${dv.id})">Excluir</button>
+        </div>
+    `).join('') || '<p style="color:var(--muted);padding:20px">Nenhum DVD cadastrado.</p>';
+
+    d.dvds.forEach(dv => {
+        filterDvd.innerHTML += `<option value="${dv.id}">${dv.name}</option>`;
+    });
+}
+
+async function createDVD() {
+    const r = await api('/admin/api/dvds', 'POST', {
+        genre_id: document.getElementById('d-genre').value,
+        name: document.getElementById('d-name').value,
+        cover_url: document.getElementById('d-cover').value
+    });
+    if (r.ok) { closeModal('modal-dvd'); loadDVDs(); loadStats(); }
+    else alert(r.error || 'Erro');
+}
+
+async function deleteDVD(id) {
+    if (confirm('Excluir DVD e todas as músicas?')) {
+        await api('/admin/api/dvds/' + id, 'DELETE');
+        loadDVDs();
+    }
+}
+
+function updateDVDSelect() {
+    const gid = document.getElementById('p-genre').value;
+    const sel = document.getElementById('p-dvd');
+    sel.innerHTML = '<option value="">Sem DVD (genérico)</option>';
+    if (gid) {
+        api('/admin/api/dvds?genre_id=' + gid).then(d => {
+            d.dvds.forEach(dv => {
+                sel.innerHTML += `<option value="${dv.id}">${dv.name}</option>`;
+            });
+        });
+    }
+}
+
+
+function updateBulkDVDSelect() {
+    const gid = document.getElementById('b-genre').value;
+    const sel = document.getElementById('b-dvd');
+    sel.innerHTML = '<option value="">Sem DVD (genérico)</option>';
+    if (gid) {
+        api('/admin/api/dvds?genre_id=' + gid).then(d => {
+            d.dvds.forEach(dv => {
+                sel.innerHTML += `<option value="${dv.id}">${dv.name}</option>`;
+            });
+        });
+    }
+}
+
+async function bulkCreatePlaylists() {
+    const resultBox = document.getElementById('bulk-result');
+    resultBox.textContent = 'Importando...';
+    const r = await api('/admin/api/playlists/bulk', 'POST', {
+        genre_id: document.getElementById('b-genre').value,
+        dvd_id: document.getElementById('b-dvd').value || null,
+        artist: document.getElementById('b-artist').value,
+        mode: document.getElementById('b-mode').value,
+        list_text: document.getElementById('b-list').value
+    });
+    if (r.ok) {
+        resultBox.textContent = `Pronto! ${r.inserted} música(s) adicionada(s). ${r.skipped ? r.skipped + ' linha(s) ignorada(s).' : ''}`;
+        document.getElementById('b-list').value = '';
+        loadPlaylists();
+        loadGenres();
+        loadStats();
+    } else {
+        resultBox.textContent = r.error || 'Erro ao importar lista.';
+        alert(r.error || 'Erro ao importar lista.');
+    }
+}
+
+
+async function importYouTubeChannel() {
+    const resultBox = document.getElementById('yc-result');
+    const btns = document.querySelectorAll('#modal-youtube-channel button');
+    const genreId = document.getElementById('yc-genre').value;
+    const channelUrl = document.getElementById('yc-channel-url').value.trim();
+    const dvdName = document.getElementById('yc-dvd-name').value.trim();
+    const artist = document.getElementById('yc-artist').value.trim();
+    const maxMinutes = document.getElementById('yc-max-minutes').value || '7';
+    const maxResults = document.getElementById('yc-max-results').value || '50';
+    const mode = document.getElementById('yc-mode').value || 'jukebox';
+
+    if (!genreId) {
+        resultBox.style.color = '#e74c3c';
+        resultBox.textContent = 'Escolha um gênero antes de importar.';
+        return;
+    }
+    if (!channelUrl) {
+        resultBox.style.color = '#e74c3c';
+        resultBox.textContent = 'Cole o link do canal ou @handle antes de importar.';
+        return;
+    }
+
+    resultBox.style.color = 'var(--yellow)';
+    resultBox.textContent = 'Importando canal... pode demorar alguns segundos. Não feche esta janela.';
+    btns.forEach(b => b.disabled = true);
+
+    try {
+        const r = await api('/admin/api/youtube/import_channel', 'POST', {
+            genre_id: genreId,
+            channel_url: channelUrl,
+            dvd_name: dvdName,
+            artist: artist,
+            max_minutes: maxMinutes,
+            max_results: maxResults,
+            mode: mode
+        });
+
+        if (r.ok) {
+            resultBox.style.color = '#2ecc71';
+            resultBox.textContent = `Pronto! DVD "${r.dvd_name}" criado. ${r.inserted} vídeo(s) importado(s), ${r.skipped || 0} ignorado(s) por duração.`;
+            await loadDVDs();
+            await loadPlaylists();
+            await loadGenres();
+            await loadStats();
+            setTimeout(() => closeModal('modal-youtube-channel'), 1800);
+        } else {
+            resultBox.style.color = '#e74c3c';
+            resultBox.textContent = r.error || 'Erro ao importar canal.';
+            alert(r.error || 'Erro ao importar canal.');
+        }
+    } catch (e) {
+        resultBox.style.color = '#e74c3c';
+        resultBox.textContent = 'Erro no navegador ao chamar o servidor: ' + e;
+        alert('Erro no navegador ao chamar o servidor: ' + e);
+    } finally {
+        btns.forEach(b => b.disabled = false);
+    }
+}
+
+// ─── PLAYLISTS ───────────────────────────────────────────────────────────────
+async function loadPlaylists() {
+    const gid = document.getElementById('filter-genre').value;
+    const did = document.getElementById('filter-dvd').value;
+    let url = '/admin/api/playlists';
+    const params = [];
+    if (gid) params.push('genre_id=' + gid);
+    if (did) params.push('dvd_id=' + did);
+    if (params.length) url += '?' + params.join('&');
+
+    const d = await api(url);
+    window._playlistsById = {};
+    d.playlists.forEach(p => window._playlistsById[p.id] = p);
+    document.getElementById('playlists-list').innerHTML = d.playlists.map(p => `
+        <div class="playlist-item">
+            <img src="https://img.youtube.com/vi/${p.youtube_id}/mqdefault.jpg"
+                 onerror="this.style.background='#333'">
+            <div style="flex:1">
+                <div style="font-weight:600">${String(p.sort_order || '').padStart(3, '0')}. ${p.title}</div>
+                <div style="font-size:12px;color:var(--muted)">
+                    ${p.artist || ''} · ${p.genre_name || ''} · ${p.dvd_name || 'Sem DVD'} · ID: <code>${p.youtube_id || ''}</code>
+                </div>
+            </div>
+            <span class="badge ${p.mode === 'karaoke' ? 'yellow' : 'green'}">${p.mode === 'karaoke' ? 'Karaokê' : 'Jukebox'}</span>
+            <button class="btn btn-sm btn-ghost" onclick="openEditPlaylist(${p.id})">Editar ID</button>
+            <button class="btn btn-sm btn-ghost" onclick="deletePlaylist(${p.id})">✕</button>
+        </div>
+    `).join('') || '<p style="color:var(--muted);padding:20px">Nenhuma música cadastrada.</p>';
+}
+
+async function createPlaylist() {
+    const r = await api('/admin/api/playlists', 'POST', {
+        genre_id: document.getElementById('p-genre').value,
+        dvd_id: document.getElementById('p-dvd').value || null,
+        title: document.getElementById('p-title').value,
+        artist: document.getElementById('p-artist').value,
+        youtube_id: document.getElementById('p-ytid').value,
+        video_url: document.getElementById('p-vidurl').value,
+        mode: document.getElementById('p-mode').value
+    });
+    if (r.ok) { closeModal('modal-playlist'); loadPlaylists(); }
+    else alert(r.error || 'Erro');
+}
+
+function openEditPlaylist(id) {
+    const p = (window._playlistsById || {})[id];
+    if (!p) return alert('Música não encontrada na tela. Atualize a lista.');
+    document.getElementById('e-id').value = p.id;
+    document.getElementById('e-title').value = p.title || '';
+    document.getElementById('e-artist').value = p.artist || '';
+    document.getElementById('e-ytid').value = p.youtube_id || '';
+    document.getElementById('e-vidurl').value = p.video_url || '';
+    document.getElementById('e-mode').value = p.mode || 'jukebox';
+    openModal('modal-edit-playlist');
+}
+
+async function saveEditedPlaylist() {
+    const id = document.getElementById('e-id').value;
+    const youtubeId = document.getElementById('e-ytid').value.trim();
+    const videoUrl = document.getElementById('e-vidurl').value.trim();
+    const r = await api('/admin/api/playlists/' + id, 'PUT', {
+        title: document.getElementById('e-title').value.trim(),
+        artist: document.getElementById('e-artist').value.trim(),
+        youtube_id: youtubeId,
+        video_url: videoUrl || (youtubeId ? 'https://www.youtube.com/watch?v=' + youtubeId : ''),
+        mode: document.getElementById('e-mode').value
+    });
+    if (r.ok) {
+        closeModal('modal-edit-playlist');
+        loadPlaylists();
+    } else {
+        alert(r.error || 'Erro ao salvar alteração');
+    }
+}
+
+async function deletePlaylist(id) {
+    await api('/admin/api/playlists/' + id, 'DELETE');
+    loadPlaylists();
+}
+
+// ─── PAGAMENTOS ──────────────────────────────────────────────────────────────
+async function loadPayments() {
+    const d = await api('/admin/api/payments');
+    document.getElementById('payments-tbody').innerHTML = d.payments.map(p => `
+        <tr>
+            <td>${p.machine_name || p.machine_id}</td>
+            <td><span class="badge blue">${p.payment_type || 'license'}</span></td>
+            <td>R$ ${(p.amount || 0).toFixed(2)}</td>
+            <td>${p.credits || 0}</td>
+            <td><span class="badge ${p.status === 'paid' ? 'green' : p.status === 'pending' ? 'yellow' : 'red'}">${p.status}</span></td>
+            <td style="font-size:12px">${(p.created_at || '').substring(0, 16)}</td>
+            <td>${p.status === 'pending' ? `<button class="btn btn-sm btn-ghost" onclick="manualPay('${p.id}')">Confirmar</button>` : '–'}</td>
+        </tr>
+    `).join('') || '<tr><td colspan=7 style="color:var(--muted);padding:20px">Nenhum pagamento.</td></tr>';
+}
+
+async function manualPay(id) {
+    await api('/admin/api/payments/' + id + '/confirm', 'POST');
+    loadPayments();
+    loadMachines();
+}
+
+// ─── FATURAMENTO ─────────────────────────────────────────────────────────────
+function populateMonthSelects() {
+    const months = [];
+    const now = new Date();
+    for (let i = 0; i < 12; i++) {
+        const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+        const val = d.toISOString().substring(0, 7);
+        const label = d.toLocaleDateString('pt-BR', { month: 'long', year: 'numeric' });
+        months.push({ val, label });
+    }
+    document.getElementById('revenue-month').innerHTML = months.map(m => `<option value="${m.val}">${m.label}</option>`).join('');
+    document.getElementById('reset-month').innerHTML = months.map(m => `<option value="${m.val}">${m.label}</option>`).join('');
+}
+
+async function loadRevenue() {
+    const month = document.getElementById('revenue-month').value;
+    const d = await api('/admin/api/revenue?month=' + month);
+    document.getElementById('revenue-tbody').innerHTML = d.revenue.map(r => `
+        <tr>
+            <td>${r.machine_name || r.machine_id}</td>
+            <td>${r.month}</td>
+            <td><strong>R$ ${(r.total || 0).toFixed(2)}</strong></td>
+        </tr>
+    `).join('') || '<tr><td colspan=3 style="color:var(--muted);padding:20px">Nenhum registro.</td></tr>';
+}
+
+async function resetRevenue() {
+    const month = document.getElementById('reset-month').value;
+    if (confirm('Zerar contadores de faturamento de ' + month + '?')) {
+        await api('/admin/api/revenue/reset', 'POST', { month });
+        loadRevenue();
+        loadStats();
+    }
+}
+
+// ─── PIX ─────────────────────────────────────────────────────────────────────
+async function loadPixConfig() {
+    const d = await api('/admin/api/pix_config');
+    document.getElementById('pix-key').value = d.pix_key || '';
+    document.getElementById('pix-name').value = d.pix_name || '';
+    document.getElementById('pix-city').value = d.pix_city || '';
+    if (document.getElementById('youtube-api-key')) document.getElementById('youtube-api-key').value = '';
+    document.getElementById('pix-status').innerHTML = d.mp_configured
+        ? '<span class="badge green">✓ Mercado Pago configurado</span>'
+        : '<span class="badge yellow">⚠ Token MP não configurado</span>';
+    document.getElementById('pix-status').innerHTML += ' ' + (d.youtube_configured
+        ? '<span class="badge green">✓ YouTube API configurada</span>'
+        : '<span class="badge yellow">⚠ YouTube API não configurada</span>');
+}
+
+async function savePixConfig() {
+    const r = await api('/admin/api/pix_config', 'POST', {
+        pix_key: document.getElementById('pix-key').value,
+        pix_name: document.getElementById('pix-name').value,
+        pix_city: document.getElementById('pix-city').value,
+        mp_token: document.getElementById('mp-token').value,
+        youtube_api_key: document.getElementById('youtube-api-key') ? document.getElementById('youtube-api-key').value : ''
+    });
+    if (r.ok) { alert('Configuração PIX salva!'); loadPixConfig(); }
+    else alert('Erro ao salvar');
+}
+
+// ─── INICIALIZAÇÃO ───────────────────────────────────────────────────────────
+loadStats();
+loadMachines();
+loadGenres();
+loadDVDs();
+loadPlaylists();
+populateMonthSelects();
+</script>
+</body>
+</html>"""
+
+
+LOGIN_HTML = """<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<title>MajuBox — Login</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+    background: #0a0a0f;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 100vh;
+    font-family: 'Segoe UI', sans-serif;
+    color: #eee;
+}
+.box {
+    background: #13131a;
+    border: 1px solid #1e1e2e;
+    border-radius: 16px;
+    padding: 40px;
+    width: 360px;
+    text-align: center;
+}
+.logo { font-size: 48px; margin-bottom: 12px; }
+.title { font-size: 24px; font-weight: 700; color: #e50914; margin-bottom: 4px; }
+.sub { font-size: 13px; color: #666; margin-bottom: 28px; }
+input {
+    background: #1a1a24;
+    border: 1px solid #1e1e2e;
+    color: #eee;
+    padding: 12px;
+    border-radius: 8px;
+    width: 100%;
+    margin-bottom: 12px;
+    font-size: 14px;
+}
+button {
+    background: #e50914;
+    color: #fff;
+    border: none;
+    padding: 12px;
+    border-radius: 8px;
+    width: 100%;
+    font-size: 15px;
+    font-weight: 700;
+    cursor: pointer;
+}
+.err { color: #e74c3c; font-size: 13px; margin-bottom: 12px; }
+</style>
+</head>
+<body>
+<div class="box">
+    <div class="logo">🎵</div>
+    <div class="title">MajuBox</div>
+    <div class="sub">Painel Administrativo</div>
+    {% if error %}<div class="err">{{ error }}</div>{% endif %}
+    <form method="POST">
+        <input type="password" name="password" placeholder="Senha de acesso" autofocus>
+        <button type="submit">Entrar</button>
+    </form>
+</div>
+</body>
+</html>"""
+
+
+# ─── Rotas Admin ──────────────────────────────────────────────────────────────
+
+@app.route("/admin")
+@app.route("/admin/")
+def admin():
+    if not session.get("admin"):
+        return redirect("/admin/login")
+    return render_template_string(ADMIN_HTML)
+
+
+@app.route("/admin/login", methods=["GET", "POST"])
+def admin_login():
+    error = None
+    if request.method == "POST":
+        if request.form.get("password") == ADMIN_PASSWORD:
+            session["admin"] = True
+            return redirect("/admin")
+        error = "Senha incorreta."
+    return render_template_string(LOGIN_HTML, error=error)
+
+
+@app.route("/admin/logout")
+def admin_logout():
+    session.clear()
+    return redirect("/admin/login")
+
+
+# ─── Admin API ────────────────────────────────────────────────────────────────
+
+def require_admin():
+    if not session.get("admin"):
+        return jsonify({}), 403
+    return None
+
+
+@app.route("/admin/api/stats")
+def admin_stats():
+    err = require_admin()
+    if err: return err
+    with get_db() as db:
+        machines = db.execute("SELECT COUNT(*) FROM machines WHERE active=1 AND license_ok=1").fetchone()[0]
+        plays = db.execute("SELECT COUNT(*) FROM plays WHERE date(played_at)=date('now')").fetchone()[0]
+        current_month = datetime.now().strftime("%Y-%m")
+        revenue = db.execute(
+            "SELECT COALESCE(SUM(total),0) FROM license_revenue WHERE month=?",
+            (current_month,)
+        ).fetchone()[0]
+        dvds = db.execute("SELECT COUNT(*) FROM dvds").fetchone()[0]
+    return jsonify({"machines": machines, "plays": plays, "revenue": revenue or 0, "dvds": dvds})
+
+
+@app.route("/admin/api/machines", methods=["GET", "POST"])
+def admin_machines():
+    err = require_admin()
+    if err: return err
+    with get_db() as db:
+        if request.method == "POST":
+            d = request.json
+            if not d.get("name"):
+                return jsonify({"ok": False, "error": "Nome obrigatório"})
+            mid = str(uuid.uuid4())[:8].upper()
+            token = hashlib.sha256((mid + str(uuid.uuid4())).encode()).hexdigest()
+            exp = (datetime.now() + timedelta(days=30)).isoformat()
+            db.execute(
+                "INSERT INTO machines(id,name,location,token,license_exp,admin_pass) VALUES(?,?,?,?,?,?)",
+                (mid, d["name"], d.get("location", ""), token, exp, d.get("admin_pass", "1234"))
+            )
+            db.commit()
+            return jsonify({"ok": True, "id": mid, "token": token})
+
+        machines = [dict(m) for m in db.execute(
+            "SELECT * FROM machines ORDER BY created_at DESC"
+        ).fetchall()]
+        return jsonify({"machines": machines})
+
+
+@app.route("/admin/api/machines/<mid>/license", methods=["POST"])
+def admin_machine_license(mid):
+    err = require_admin()
+    if err: return err
+    d = request.json
+    with get_db() as db:
+        active = 1 if d.get("active") else 0
+        exp = (datetime.now() + timedelta(days=30)).isoformat() if active else None
+        db.execute("UPDATE machines SET license_ok=?, license_exp=? WHERE id=?", (active, exp, mid))
+        db.commit()
+    return jsonify({"ok": True})
+
+
+@app.route("/admin/api/machines/<mid>/reset_pass", methods=["POST"])
+def admin_machine_reset_pass(mid):
+    err = require_admin()
+    if err: return err
+    d = request.json
+    with get_db() as db:
+        db.execute("UPDATE machines SET admin_pass=? WHERE id=?", (d.get("password", "1234"), mid))
+        db.commit()
+    return jsonify({"ok": True})
+
+
+@app.route("/admin/api/genres", methods=["GET", "POST"])
+def admin_genres():
+    err = require_admin()
+    if err: return err
+    with get_db() as db:
+        if request.method == "POST":
+            d = request.json
+            if not d.get("name"):
+                return jsonify({"ok": False, "error": "Nome obrigatório"})
+            db.execute("INSERT INTO genres(name,cover_url) VALUES(?,?)",
+                       (d["name"], d.get("cover_url", "")))
+            db.commit()
+            return jsonify({"ok": True})
+
+        genres = []
+        for g in db.execute("""
+            SELECT g.*,
+                   COUNT(DISTINCT d.id) as dvd_count,
+                   COUNT(DISTINCT p.id) as song_count
+            FROM genres g
+            LEFT JOIN dvds d ON d.genre_id = g.id
+            LEFT JOIN playlists p ON p.genre_id = g.id
+            GROUP BY g.id ORDER BY g.sort_order
+        """).fetchall():
+            genres.append(dict(g))
+        return jsonify({"genres": genres})
+
+
+@app.route("/admin/api/genres/<int:gid>", methods=["DELETE"])
+def admin_genre_delete(gid):
+    err = require_admin()
+    if err: return err
+    with get_db() as db:
+        db.execute("DELETE FROM genres WHERE id=?", (gid,))
+        db.commit()
+    return jsonify({"ok": True})
+
+
+@app.route("/admin/api/dvds", methods=["GET", "POST"])
+def admin_dvds():
+    err = require_admin()
+    if err: return err
+    with get_db() as db:
+        if request.method == "POST":
+            d = request.json
+            if not d.get("name") or not d.get("genre_id"):
+                return jsonify({"ok": False, "error": "Nome e gênero obrigatórios"})
+            db.execute("INSERT INTO dvds(genre_id,name,cover_url) VALUES(?,?,?)",
+                       (d["genre_id"], d["name"], d.get("cover_url", "")))
+            db.commit()
+            return jsonify({"ok": True})
+
+        gid = request.args.get("genre_id")
+        q = """
+            SELECT d.*, g.name as genre_name,
+                   COUNT(p.id) as song_count
+            FROM dvds d
+            LEFT JOIN genres g ON g.id = d.genre_id
+            LEFT JOIN playlists p ON p.dvd_id = d.id
+        """
+        args = ()
+        if gid:
+            q += " WHERE d.genre_id = ?"
+            args = (gid,)
+        q += " GROUP BY d.id ORDER BY d.genre_id, d.sort_order"
+        dvds = [dict(d) for d in db.execute(q, args).fetchall()]
+        return jsonify({"dvds": dvds})
+
+
+@app.route("/admin/api/dvds/<int:did>", methods=["DELETE"])
+def admin_dvd_delete(did):
+    err = require_admin()
+    if err: return err
+    with get_db() as db:
+        db.execute("DELETE FROM dvds WHERE id=?", (did,))
+        db.commit()
+    return jsonify({"ok": True})
+
+
+@app.route("/admin/api/playlists", methods=["GET", "POST"])
+def admin_playlists():
+    err = require_admin()
+    if err: return err
+    with get_db() as db:
+        if request.method == "POST":
+            d = request.json
+            if not d.get("title") or (not d.get("youtube_id") and not d.get("video_url")):
+                return jsonify({"ok": False, "error": "Título e vídeo obrigatórios"})
+            genre_id = d.get("genre_id")
+            dvd_id = d.get("dvd_id")
+            next_order = db.execute("SELECT COALESCE(MAX(sort_order), 0) + 1 FROM playlists WHERE genre_id=? AND COALESCE(dvd_id,0)=COALESCE(?,0)", (genre_id, dvd_id)).fetchone()[0] or 1
+            db.execute(
+                "INSERT INTO playlists(genre_id,dvd_id,title,artist,youtube_id,video_url,mode,sort_order) VALUES(?,?,?,?,?,?,?,?)",
+                (genre_id, dvd_id, d["title"], d.get("artist", ""),
+                 d.get("youtube_id", ""), d.get("video_url", ""), d.get("mode", "jukebox"), next_order)
+            )
+            db.commit()
+            return jsonify({"ok": True})
+
+        gid = request.args.get("genre_id")
+        did = request.args.get("dvd_id")
+        q = """
+            SELECT p.*, g.name as genre_name, d.name as dvd_name
+            FROM playlists p
+            LEFT JOIN genres g ON g.id = p.genre_id
+            LEFT JOIN dvds d ON d.id = p.dvd_id
+        """
+        args = []
+        if gid:
+            q += " WHERE p.genre_id = ?"
+            args.append(gid)
+        if did:
+            q += " WHERE p.dvd_id = ?" if not gid else " AND p.dvd_id = ?"
+            args.append(did)
+        q += " ORDER BY p.genre_id, p.sort_order"
+        playlists = [dict(p) for p in db.execute(q, args).fetchall()]
+        return jsonify({"playlists": playlists})
+
+
+
+def parse_bulk_playlist_text(text):
+    """Aceita linhas tipo: | Música | `youtube_id` |, Música<TAB>ID, Música;ID ou Música,ID."""
+    items = []
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if set(line) <= {"|", "-", ":", " "}:
+            continue
+        parts = []
+        if "|" in line:
+            parts = [p.strip().strip("`").strip() for p in line.strip("|").split("|")]
+        elif "\t" in line:
+            parts = [p.strip().strip("`").strip() for p in line.split("\t")]
+        elif ";" in line:
+            parts = [p.strip().strip("`").strip() for p in line.split(";")]
+        elif "," in line:
+            parts = [p.strip().strip("`").strip() for p in line.rsplit(",", 1)]
+        else:
+            tokens = line.rsplit(None, 1)
+            if len(tokens) == 2:
+                parts = [tokens[0].strip(), tokens[1].strip().strip("`")]
+
+        parts = [p for p in parts if p]
+        if len(parts) < 2:
+            continue
+        title, youtube_id = parts[0], parts[1]
+        # ignora cabeçalho comum
+        if title.lower() in {"nome", "música", "musica", "titulo", "título", "title"}:
+            continue
+        if youtube_id.lower() in {"id", "youtube", "youtube_id"}:
+            continue
+        items.append({"title": title, "youtube_id": youtube_id})
+    return items
+
+
+
+def youtube_api_get(path, params):
+    """Chama a YouTube Data API v3 usando API key salva no servidor."""
+    if not YOUTUBE_API_KEY:
+        raise RuntimeError("Chave YouTube API não configurada. Vá em PIX > YouTube API e salve a chave.")
+    params = dict(params or {})
+    params["key"] = YOUTUBE_API_KEY
+    url = "https://www.googleapis.com/youtube/v3/" + path + "?" + urllib.parse.urlencode(params)
+    req = urllib.request.Request(url, headers={"User-Agent": "MajuBox/1.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        msg = e.read().decode("utf-8", errors="ignore")
+        raise RuntimeError(f"Erro YouTube API {e.code}: {msg[:300]}")
+
+
+def iso8601_duration_to_seconds(value):
+    """Converte duração ISO 8601 do YouTube, ex: PT3M45S, para segundos."""
+    m = re.match(r"^PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?$", value or "")
+    if not m:
+        return 0
+    h = int(m.group(1) or 0)
+    minutes = int(m.group(2) or 0)
+    seconds = int(m.group(3) or 0)
+    return h * 3600 + minutes * 60 + seconds
+
+
+def extract_channel_hint(channel_url):
+    txt = (channel_url or "").strip()
+    if not txt:
+        return ""
+    if txt.startswith("@"):
+        return txt
+    try:
+        parsed = urllib.parse.urlparse(txt if txt.startswith("http") else "https://" + txt)
+        path = parsed.path.strip("/")
+        if path.startswith("channel/"):
+            return path.split("/", 1)[1].split("/")[0]
+        if path.startswith("@"):
+            return path.split("/")[0]
+        if path.startswith("c/") or path.startswith("user/"):
+            return path.split("/", 1)[1].split("/")[0]
+        if parsed.netloc:
+            return path.split("/")[0] if path else txt
+    except Exception:
+        pass
+    return txt
+
+
+def resolve_youtube_channel(channel_url):
+    """Resolve link/@handle/nome para dados do canal e playlist de uploads."""
+    hint = extract_channel_hint(channel_url)
+    if not hint:
+        raise RuntimeError("Informe o link do canal ou @handle.")
+
+    channel_id = None
+    # Canal direto UC...
+    if hint.startswith("UC") and len(hint) >= 20:
+        channel_id = hint
+    else:
+        query = hint[1:] if hint.startswith("@") else hint
+        data = youtube_api_get("search", {"part": "snippet", "type": "channel", "q": query, "maxResults": 1})
+        items = data.get("items", [])
+        if not items:
+            raise RuntimeError("Canal não encontrado pelo YouTube.")
+        channel_id = items[0].get("snippet", {}).get("channelId") or items[0].get("id", {}).get("channelId")
+
+    ch = youtube_api_get("channels", {"part": "snippet,contentDetails", "id": channel_id, "maxResults": 1})
+    items = ch.get("items", [])
+    if not items:
+        raise RuntimeError("Não consegui abrir os dados do canal.")
+    item = items[0]
+    snippet = item.get("snippet", {})
+    uploads = item.get("contentDetails", {}).get("relatedPlaylists", {}).get("uploads")
+    if not uploads:
+        raise RuntimeError("Não encontrei a playlist de uploads do canal.")
+    thumbs = snippet.get("thumbnails", {})
+    cover = (thumbs.get("high") or thumbs.get("medium") or thumbs.get("default") or {}).get("url", "")
+    return {
+        "channel_id": channel_id,
+        "title": snippet.get("title", "Canal YouTube"),
+        "cover_url": cover,
+        "uploads_playlist_id": uploads,
+    }
+
+
+def fetch_channel_videos(uploads_playlist_id, max_results=50):
+    """Busca vídeos da playlist de uploads e completa metadados/duração."""
+    max_results = max(1, min(int(max_results or 50), 200))
+    collected = []
+    page_token = None
+    while len(collected) < max_results:
+        batch_size = min(50, max_results - len(collected))
+        params = {"part": "snippet,contentDetails", "playlistId": uploads_playlist_id, "maxResults": batch_size}
+        if page_token:
+            params["pageToken"] = page_token
+        data = youtube_api_get("playlistItems", params)
+        for it in data.get("items", []):
+            vid = it.get("contentDetails", {}).get("videoId") or it.get("snippet", {}).get("resourceId", {}).get("videoId")
+            if vid:
+                collected.append({"id": vid, "playlist_snippet": it.get("snippet", {})})
+        page_token = data.get("nextPageToken")
+        if not page_token:
+            break
+
+    result = []
+    for i in range(0, len(collected), 50):
+        chunk = collected[i:i+50]
+        ids = ",".join(v["id"] for v in chunk)
+        data = youtube_api_get("videos", {"part": "snippet,contentDetails,status", "id": ids, "maxResults": 50})
+        for item in data.get("items", []):
+            vid = item.get("id")
+            sn = item.get("snippet", {})
+            cd = item.get("contentDetails", {})
+            thumbs = sn.get("thumbnails", {})
+            cover = (thumbs.get("maxres") or thumbs.get("high") or thumbs.get("medium") or thumbs.get("default") or {}).get("url", "")
+            result.append({
+                "youtube_id": vid,
+                "title": sn.get("title", vid),
+                "duration_seconds": iso8601_duration_to_seconds(cd.get("duration", "")),
+                "cover_url": cover,
+            })
+    return result
+
+@app.route("/admin/api/playlists/bulk", methods=["POST"])
+def admin_playlists_bulk():
+    err = require_admin()
+    if err: return err
+    d = request.json or {}
+    text = d.get("list_text", "")
+    items = parse_bulk_playlist_text(text)
+    if not items:
+        return jsonify({"ok": False, "error": "Nenhuma música encontrada. Use: | Nome da música | ID do YouTube |"})
+
+    genre_id = d.get("genre_id") or None
+    dvd_id = d.get("dvd_id") or None
+    artist = d.get("artist", "")
+    mode = d.get("mode", "jukebox") or "jukebox"
+
+    with get_db() as db:
+        if dvd_id and not genre_id:
+            row = db.execute("SELECT genre_id FROM dvds WHERE id=?", (dvd_id,)).fetchone()
+            if row:
+                genre_id = row["genre_id"]
+
+        if not genre_id:
+            return jsonify({"ok": False, "error": "Escolha um gênero antes de importar."})
+
+        inserted = 0
+        skipped = 0
+        base_order = db.execute("SELECT COALESCE(MAX(sort_order), 0) FROM playlists WHERE genre_id=? AND COALESCE(dvd_id,0)=COALESCE(?,0)", (genre_id, dvd_id)).fetchone()[0] or 0
+        for item in items:
+            title = item["title"].strip()
+            youtube_id = item["youtube_id"].strip()
+            if not title or not youtube_id:
+                skipped += 1
+                continue
+            inserted += 1
+            db.execute(
+                "INSERT INTO playlists(genre_id,dvd_id,title,artist,youtube_id,video_url,mode,sort_order) VALUES(?,?,?,?,?,?,?,?)",
+                (genre_id, dvd_id, title, artist, youtube_id, f"https://www.youtube.com/watch?v={youtube_id}", mode, base_order + inserted)
+            )
+        db.commit()
+
+    return jsonify({"ok": True, "inserted": inserted, "skipped": skipped})
+
+
+@app.route("/admin/api/youtube/import_channel", methods=["POST"])
+def admin_youtube_import_channel():
+    err = require_admin()
+    if err: return err
+    d = request.json or {}
+    genre_id = d.get("genre_id") or None
+    channel_url = (d.get("channel_url") or "").strip()
+    dvd_name_input = (d.get("dvd_name") or "").strip()
+    artist_input = (d.get("artist") or "").strip()
+    mode = d.get("mode", "jukebox") or "jukebox"
+    try:
+        max_minutes = float(d.get("max_minutes", 7) or 7)
+        max_results = int(d.get("max_results", 50) or 50)
+    except Exception:
+        return jsonify({"ok": False, "error": "Limite de minutos ou quantidade inválida."})
+    if not genre_id:
+        return jsonify({"ok": False, "error": "Escolha um gênero."})
+    if not channel_url:
+        return jsonify({"ok": False, "error": "Informe o link do canal."})
+
+    try:
+        channel = resolve_youtube_channel(channel_url)
+        videos = fetch_channel_videos(channel["uploads_playlist_id"], max_results=max_results)
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)})
+
+    max_seconds = int(max_minutes * 60)
+    dvd_name = dvd_name_input or channel["title"]
+    artist = artist_input or channel["title"]
+
+    with get_db() as db:
+        next_dvd_order = db.execute("SELECT COALESCE(MAX(sort_order),0)+1 FROM dvds WHERE genre_id=?", (genre_id,)).fetchone()[0] or 1
+        cur = db.execute(
+            "INSERT INTO dvds(genre_id,name,cover_url,sort_order) VALUES(?,?,?,?)",
+            (genre_id, dvd_name, channel.get("cover_url", ""), next_dvd_order)
+        )
+        dvd_id = cur.lastrowid
+        base_order = db.execute("SELECT COALESCE(MAX(sort_order),0) FROM playlists WHERE genre_id=? AND COALESCE(dvd_id,0)=COALESCE(?,0)", (genre_id, dvd_id)).fetchone()[0] or 0
+        inserted = 0
+        skipped = 0
+        for video in videos:
+            dur = video.get("duration_seconds", 0)
+            if not dur or dur > max_seconds:
+                skipped += 1
+                continue
+            inserted += 1
+            db.execute(
+                "INSERT INTO playlists(genre_id,dvd_id,title,artist,youtube_id,video_url,cover_url,mode,sort_order) VALUES(?,?,?,?,?,?,?,?,?)",
+                (genre_id, dvd_id, video["title"], artist, video["youtube_id"], f"https://www.youtube.com/watch?v={video['youtube_id']}", video.get("cover_url", ""), mode, base_order + inserted)
+            )
+        db.commit()
+
+    return jsonify({"ok": True, "dvd_id": dvd_id, "dvd_name": dvd_name, "inserted": inserted, "skipped": skipped, "channel_title": channel["title"]})
+
+
+@app.route("/admin/api/playlists/<int:pid>", methods=["DELETE", "PUT"])
+def admin_playlist_edit_delete(pid):
+    err = require_admin()
+    if err: return err
+    with get_db() as db:
+        if request.method == "PUT":
+            d = request.json or {}
+            title = (d.get("title") or "").strip()
+            youtube_id = (d.get("youtube_id") or "").strip()
+            video_url = (d.get("video_url") or "").strip()
+            if not title:
+                return jsonify({"ok": False, "error": "Título obrigatório"})
+            if not youtube_id and not video_url:
+                return jsonify({"ok": False, "error": "Informe o ID do YouTube ou a URL do vídeo"})
+            if youtube_id and not video_url:
+                video_url = f"https://www.youtube.com/watch?v={youtube_id}"
+            db.execute(
+                "UPDATE playlists SET title=?, artist=?, youtube_id=?, video_url=?, mode=? WHERE id=?",
+                (title, d.get("artist", ""), youtube_id, video_url, d.get("mode", "jukebox"), pid)
+            )
+            db.commit()
+            return jsonify({"ok": True})
+
+        db.execute("DELETE FROM playlists WHERE id=?", (pid,))
+        db.commit()
+    return jsonify({"ok": True})
+
+
+@app.route("/admin/api/payments")
+def admin_payments():
+    err = require_admin()
+    if err: return err
+    with get_db() as db:
+        payments = [dict(p) for p in db.execute("""
+            SELECT pay.*, m.name as machine_name
+            FROM payments pay
+            LEFT JOIN machines m ON m.id = pay.machine_id
+            ORDER BY pay.created_at DESC LIMIT 200
+        """).fetchall()]
+        return jsonify({"payments": payments})
+
+
+@app.route("/admin/api/payments/<pid>/confirm", methods=["POST"])
+def admin_payment_confirm(pid):
+    err = require_admin()
+    if err: return err
+    with get_db() as db:
+        p = db.execute("SELECT * FROM payments WHERE id=?", (pid,)).fetchone()
+        if p:
+            db.execute("UPDATE payments SET status='paid', paid_at=datetime('now') WHERE id=?", (pid,))
+            if p["payment_type"] == "license":
+                exp = (datetime.now() + timedelta(days=30)).isoformat()
+                db.execute("UPDATE machines SET license_ok=1, license_exp=? WHERE id=?",
+                           (exp, p["machine_id"]))
+                month = datetime.now().strftime("%Y-%m")
+                existing = db.execute(
+                    "SELECT id FROM license_revenue WHERE machine_id=? AND month=?",
+                    (p["machine_id"], month)
+                ).fetchone()
+                if existing:
+                    db.execute("UPDATE license_revenue SET total=total+? WHERE id=?",
+                               (p["amount"], existing["id"]))
+                else:
+                    db.execute("INSERT INTO license_revenue(machine_id,month,total) VALUES(?,?,?)",
+                               (p["machine_id"], month, p["amount"]))
+            db.commit()
+    return jsonify({"ok": True})
+
+
+@app.route("/admin/api/revenue")
+def admin_revenue():
+    err = require_admin()
+    if err: return err
+    month = request.args.get("month", datetime.now().strftime("%Y-%m"))
+    with get_db() as db:
+        revenue = [dict(r) for r in db.execute("""
+            SELECT lr.*, m.name as machine_name
+            FROM license_revenue lr
+            LEFT JOIN machines m ON m.id = lr.machine_id
+            WHERE lr.month = ?
+            ORDER BY lr.total DESC
+        """, (month,)).fetchall()]
+        return jsonify({"revenue": revenue})
+
+
+@app.route("/admin/api/revenue/reset", methods=["POST"])
+def admin_revenue_reset():
+    err = require_admin()
+    if err: return err
+    d = request.json
+    month = d.get("month", datetime.now().strftime("%Y-%m"))
+    with get_db() as db:
+        db.execute("DELETE FROM license_revenue WHERE month=?", (month,))
+        db.commit()
+    return jsonify({"ok": True})
+
+
+@app.route("/admin/api/pix_config", methods=["GET", "POST"])
+def admin_pix_config():
+    global MP_ACCESS_TOKEN, YOUTUBE_API_KEY
+    err = require_admin()
+    if err: return err
+    config_path = PIX_CONFIG_PATH
+
+    if request.method == "POST":
+        d = request.json
+        old_config = {}
+        yt_old_config = {}
+        if YOUTUBE_CONFIG_PATH.exists():
+            try:
+                yt_old_config = json.loads(YOUTUBE_CONFIG_PATH.read_text(encoding="utf-8"))
+            except Exception:
+                yt_old_config = {}
+        if config_path.exists():
+            try:
+                old_config = json.loads(config_path.read_text(encoding="utf-8"))
+            except Exception:
+                old_config = {}
+        config = {
+            "pix_key": d.get("pix_key", ""),
+            "pix_name": d.get("pix_name", ""),
+            "pix_city": d.get("pix_city", ""),
+            "mp_token": old_config.get("mp_token", ""),
+        }
+        if d.get("mp_token"):
+            MP_ACCESS_TOKEN = d["mp_token"].strip()
+            os.environ["MP_ACCESS_TOKEN"] = MP_ACCESS_TOKEN
+            config["mp_token"] = MP_ACCESS_TOKEN
+        yt_config = {"youtube_api_key": yt_old_config.get("youtube_api_key", "")}
+        if d.get("youtube_api_key"):
+            YOUTUBE_API_KEY = d["youtube_api_key"].strip()
+            os.environ["YOUTUBE_API_KEY"] = YOUTUBE_API_KEY
+            yt_config["youtube_api_key"] = YOUTUBE_API_KEY
+        YOUTUBE_CONFIG_PATH.write_text(json.dumps(yt_config, indent=2, ensure_ascii=False), encoding="utf-8")
+        config_path.write_text(json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8")
+        return jsonify({"ok": True})
+
+    if config_path.exists():
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+    else:
+        config = {"pix_key": "", "pix_name": "", "pix_city": "", "mp_token": ""}
+
+    yt_config = {}
+    if YOUTUBE_CONFIG_PATH.exists():
+        try:
+            yt_config = json.loads(YOUTUBE_CONFIG_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            yt_config = {}
+    config["mp_configured"] = bool(MP_ACCESS_TOKEN or config.get("mp_token"))
+    config["youtube_configured"] = bool(YOUTUBE_API_KEY or yt_config.get("youtube_api_key"))
+    config.pop("mp_token", None)
+    return jsonify(config)
+
+
+@app.route("/")
+def index():
+    return redirect("/admin")
+
+
+if __name__ == "__main__":
+    print("=" * 55)
+    print("  🎵 MajuBox — Servidor Central")
+    print("  📊 Painel Admin: http://localhost:5000/admin")
+    print(f"  🔑 Senha admin: {ADMIN_PASSWORD}")
+    print("=" * 55)
+    print()
+    print("  Variáveis de ambiente:")
+    print("    ADMIN_PASSWORD  — senha do painel admin")
+    print("    MP_ACCESS_TOKEN — token Mercado Pago (PIX)")
+    print("=" * 55)
+    app.run(host="0.0.0.0", port=5000, debug=False)
