@@ -72,6 +72,19 @@ def _load_saved_mp_token():
         print(f"[PIX CONFIG] Nao consegui carregar token Mercado Pago: {e}")
 
 _load_saved_mp_token()
+
+def get_license_price():
+    """Valor da licença mensal configurado no painel PIX."""
+    try:
+        if PIX_CONFIG_PATH.exists():
+            cfg = json.loads(PIX_CONFIG_PATH.read_text(encoding="utf-8"))
+            raw = str(cfg.get("license_price", "10.00")).replace(",", ".").strip()
+            value = float(raw or 10.0)
+            return max(0.01, value)
+    except Exception as e:
+        print(f"[PIX CONFIG] Erro ao carregar valor da licença: {e}")
+    return 10.0
+
 # Para Mercado Livre, usar:
 ML_ACCESS_TOKEN = os.environ.get("ML_ACCESS_TOKEN", "")
 ML_CLIENT_ID = os.environ.get("ML_CLIENT_ID", "")
@@ -610,23 +623,51 @@ def pix_webhook():
 
 
 def _get_or_create_license_pix(machine_id, db):
-    """Cria ou recupera PIX pendente para renovação de licença"""
+    """Cria ou recupera PIX pendente para renovação de licença, usando o valor configurado no painel PIX."""
+    amount = get_license_price()
     existing = db.execute(
-        "SELECT * FROM payments WHERE machine_id=? AND status='pending' AND payment_type='license'",
+        "SELECT * FROM payments WHERE machine_id=? AND status='pending' AND payment_type='license' ORDER BY created_at DESC LIMIT 1",
         (machine_id,)
     ).fetchone()
+
+    # Se o valor foi alterado no painel, cancela o PIX pendente antigo e cria outro no valor novo.
+    if existing and abs(float(existing["amount"] or 0) - float(amount)) > 0.001:
+        db.execute("UPDATE payments SET status='cancelled' WHERE id=?", (existing["id"],))
+        db.commit()
+        existing = None
+
     if existing:
-        return {"qr_code": existing["pix_qr"], "pix_code": existing["pix_code"]}
+        return {
+            "payment_id": existing["mp_id"],
+            "amount": float(existing["amount"] or amount),
+            "qr_code": existing["pix_qr"],
+            "pix_code": existing["pix_code"],
+            "copy_paste": existing["pix_code"],
+            "message": f"Licença mensal: R$ {float(existing['amount'] or amount):.2f}. Após aprovado libera por 30 dias."
+        }
 
     payment_id = str(uuid.uuid4())
-    pix = create_pix_payment(10.0, f"MajuBox - Renovação Licença {machine_id[:8]}", machine_id)
+    pix = create_pix_payment(amount, f"MajuBox - Renovação Licença {machine_id[:8]}", machine_id)
+    if not pix.get("ok"):
+        return {
+            "amount": amount,
+            "error": pix.get("error", "Erro ao criar PIX da licença"),
+            "message": "Não foi possível gerar PIX. Verifique o token Mercado Pago do servidor."
+        }
 
     db.execute(
-        "INSERT INTO payments(id,machine_id,amount,pix_qr,pix_code,mp_id,payment_type) VALUES(?,?,?,?,?,?,?)",
-        (payment_id, machine_id, 10.0, pix["qr_code"], pix["pix_code"], pix["mp_id"], "license")
+        "INSERT INTO payments(id,machine_id,amount,pix_qr,pix_code,mp_id,payment_type,status) VALUES(?,?,?,?,?,?,?,?)",
+        (payment_id, machine_id, amount, pix["qr_code"], pix["pix_code"], pix["mp_id"], "license", "pending")
     )
     db.commit()
-    return {"qr_code": pix["qr_code"], "pix_code": pix["pix_code"]}
+    return {
+        "payment_id": pix["mp_id"],
+        "amount": amount,
+        "qr_code": pix["qr_code"],
+        "pix_code": pix["pix_code"],
+        "copy_paste": pix["pix_code"],
+        "message": f"Licença mensal: R$ {amount:.2f}. Após aprovado libera por 30 dias."
+    }
 
 
 # ─── Painel Admin ─────────────────────────────────────────────────────────────
@@ -959,6 +1000,9 @@ th { color: var(--muted); font-weight: 600; }
         <input id="pix-city" placeholder="Sua cidade">
         <label>Token Mercado Pago</label>
         <input id="mp-token" type="password" placeholder="APP_USR-...">
+        <label>Valor da licença mensal (R$)</label>
+        <input id="license-price" type="number" step="0.01" min="0.01" placeholder="Ex: 15.00">
+        <p style="color:var(--muted);font-size:12px;margin-top:-8px;margin-bottom:10px">Esse é o valor do PIX de liberação quando a licença da máquina vencer. Ao pagar, libera por 30 dias.</p>
         <hr style="border:0;border-top:1px solid var(--border);margin:18px 0">
         <h3 style="font-size:15px;margin-bottom:6px">📺 YouTube API</h3>
         <p style="color:var(--muted);font-size:12px;margin-bottom:8px">Cole sua chave da YouTube Data API para importar canais automaticamente.</p>
@@ -1688,6 +1732,7 @@ async function loadPixConfig() {
     document.getElementById('pix-key').value = d.pix_key || '';
     document.getElementById('pix-name').value = d.pix_name || '';
     document.getElementById('pix-city').value = d.pix_city || '';
+    if (document.getElementById('license-price')) document.getElementById('license-price').value = d.license_price || '10.00';
     if (document.getElementById('youtube-api-key')) document.getElementById('youtube-api-key').value = '';
     document.getElementById('pix-status').innerHTML = d.mp_configured
         ? '<span class="badge green">✓ Mercado Pago configurado</span>'
@@ -1695,6 +1740,7 @@ async function loadPixConfig() {
     document.getElementById('pix-status').innerHTML += ' ' + (d.youtube_configured
         ? '<span class="badge green">✓ YouTube API configurada</span>'
         : '<span class="badge yellow">⚠ YouTube API não configurada</span>');
+    document.getElementById('pix-status').innerHTML += ' <span class="badge blue">Licença R$ ' + (d.license_price || '10.00') + ' / 30 dias</span>';
 }
 
 async function savePixConfig() {
@@ -1703,6 +1749,7 @@ async function savePixConfig() {
         pix_name: document.getElementById('pix-name').value,
         pix_city: document.getElementById('pix-city').value,
         mp_token: document.getElementById('mp-token').value,
+        license_price: document.getElementById('license-price') ? document.getElementById('license-price').value : '10.00',
         youtube_api_key: document.getElementById('youtube-api-key') ? document.getElementById('youtube-api-key').value : ''
     });
     if (r.ok) { alert('Configuração PIX salva!'); loadPixConfig(); }
@@ -2632,11 +2679,17 @@ def admin_pix_config():
                 old_config = json.loads(config_path.read_text(encoding="utf-8"))
             except Exception:
                 old_config = {}
+        license_price = str(d.get("license_price", old_config.get("license_price", "10.00")) or "10.00").replace(",", ".").strip()
+        try:
+            license_price = f"{max(0.01, float(license_price)):.2f}"
+        except Exception:
+            license_price = old_config.get("license_price", "10.00")
         config = {
             "pix_key": d.get("pix_key", ""),
             "pix_name": d.get("pix_name", ""),
             "pix_city": d.get("pix_city", ""),
             "mp_token": old_config.get("mp_token", ""),
+            "license_price": license_price,
         }
         if d.get("mp_token"):
             MP_ACCESS_TOKEN = d["mp_token"].strip()
@@ -2654,7 +2707,9 @@ def admin_pix_config():
     if config_path.exists():
         config = json.loads(config_path.read_text(encoding="utf-8"))
     else:
-        config = {"pix_key": "", "pix_name": "", "pix_city": "", "mp_token": ""}
+        config = {"pix_key": "", "pix_name": "", "pix_city": "", "mp_token": "", "license_price": "10.00"}
+    if not config.get("license_price"):
+        config["license_price"] = "10.00"
 
     yt_config = {}
     if YOUTUBE_CONFIG_PATH.exists():
