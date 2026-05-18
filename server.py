@@ -113,6 +113,11 @@ def init_db():
             pix_name    TEXT,
             pix_city    TEXT,
             mp_token    TEXT,
+            last_seen   TEXT,
+            last_ip     TEXT,
+            last_user_agent TEXT,
+            last_error  TEXT,
+            app_version TEXT,
             created_at  TEXT DEFAULT (datetime('now'))
         );
 
@@ -188,54 +193,20 @@ def init_db():
             db.execute("ALTER TABLE payments ADD COLUMN credited INTEGER DEFAULT 0")
 
         # Migrações seguras para bancos antigos
-        # IMPORTANTE: SQLite não aceita ADD COLUMN ... UNIQUE em banco já existente.
-        # Isso fazia o Render manter banco antigo sem a coluna hwid/mp_token e a rota
-        # /api/machine/check quebrava com HTTP 500. Por isso adicionamos colunas sem UNIQUE.
-        def _cols(table):
-            return [r[1] for r in db.execute(f"PRAGMA table_info({table})").fetchall()]
-
-        machine_cols = _cols("machines")
-        machine_adds = {
-            "hwid": "ALTER TABLE machines ADD COLUMN hwid TEXT",
-            "mp_token": "ALTER TABLE machines ADD COLUMN mp_token TEXT",
-            "pix_key": "ALTER TABLE machines ADD COLUMN pix_key TEXT",
-            "pix_name": "ALTER TABLE machines ADD COLUMN pix_name TEXT",
-            "pix_city": "ALTER TABLE machines ADD COLUMN pix_city TEXT",
-            "admin_pass": "ALTER TABLE machines ADD COLUMN admin_pass TEXT DEFAULT '1234'",
-            "license_ok": "ALTER TABLE machines ADD COLUMN license_ok INTEGER DEFAULT 1",
-            "license_exp": "ALTER TABLE machines ADD COLUMN license_exp TEXT",
-            "active": "ALTER TABLE machines ADD COLUMN active INTEGER DEFAULT 1",
-            "location": "ALTER TABLE machines ADD COLUMN location TEXT",
-        }
-        for col, sql in machine_adds.items():
-            if col not in machine_cols:
-                try:
-                    db.execute(sql)
-                except Exception as e:
-                    print(f"[DB MIGRATION machines.{col}] {e}")
-
-        payment_cols = _cols("payments")
-        payment_adds = {
-            "credited": "ALTER TABLE payments ADD COLUMN credited INTEGER DEFAULT 0",
-            "payment_type": "ALTER TABLE payments ADD COLUMN payment_type TEXT DEFAULT 'license'",
-            "mp_id": "ALTER TABLE payments ADD COLUMN mp_id TEXT",
-            "pix_qr": "ALTER TABLE payments ADD COLUMN pix_qr TEXT",
-            "pix_code": "ALTER TABLE payments ADD COLUMN pix_code TEXT",
-            "credits": "ALTER TABLE payments ADD COLUMN credits INTEGER DEFAULT 0",
-            "paid_at": "ALTER TABLE payments ADD COLUMN paid_at TEXT",
-        }
-        for col, sql in payment_adds.items():
-            if col not in payment_cols:
-                try:
-                    db.execute(sql)
-                except Exception as e:
-                    print(f"[DB MIGRATION payments.{col}] {e}")
-
-        try:
-            db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_machines_token ON machines(token)")
-            db.execute("CREATE INDEX IF NOT EXISTS idx_machines_hwid ON machines(hwid)")
-        except Exception as e:
-            print(f"[DB INDEX] {e}")
+        for sql in [
+            "ALTER TABLE machines ADD COLUMN hwid TEXT UNIQUE",
+            "ALTER TABLE machines ADD COLUMN mp_token TEXT",
+            "ALTER TABLE machines ADD COLUMN last_seen TEXT",
+            "ALTER TABLE machines ADD COLUMN last_ip TEXT",
+            "ALTER TABLE machines ADD COLUMN last_user_agent TEXT",
+            "ALTER TABLE machines ADD COLUMN last_error TEXT",
+            "ALTER TABLE machines ADD COLUMN app_version TEXT",
+            "ALTER TABLE payments ADD COLUMN credited INTEGER DEFAULT 0",
+        ]:
+            try:
+                db.execute(sql)
+            except Exception:
+                pass
 
         # Gêneros padrão
         count = db.execute("SELECT COUNT(*) FROM genres").fetchone()[0]
@@ -280,17 +251,76 @@ def init_db():
 
 init_db()
 
+# ─── Status online/offline das máquinas ───────────────────────────────────────
+def _parse_dt_safe(value):
+    """Converte datas SQLite/ISO em datetime, sem quebrar o painel."""
+    if not value:
+        return None
+    try:
+        txt = str(value).replace("Z", "").replace("T", " ")
+        # remove microssegundos longos se vierem em formato ISO
+        return datetime.fromisoformat(txt)
+    except Exception:
+        try:
+            return datetime.strptime(str(value), "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return None
+
+
+def _machine_status_dict(machine_row, online_limit_seconds=90):
+    """Define bolinha verde/vermelha conforme último contato da máquina."""
+    m = dict(machine_row)
+    last_dt = _parse_dt_safe(m.get("last_seen"))
+    if last_dt:
+        seconds = max(0, int((datetime.utcnow() - last_dt).total_seconds()))
+    else:
+        seconds = None
+    online = seconds is not None and seconds <= online_limit_seconds
+    m["online"] = online
+    m["status_color"] = "green" if online else "red"
+    m["status_text"] = "Online" if online else "Offline"
+    m["last_seen_seconds"] = seconds
+    if seconds is None:
+        m["last_seen_label"] = "Nunca conectou"
+    elif seconds < 60:
+        m["last_seen_label"] = f"há {seconds}s"
+    elif seconds < 3600:
+        m["last_seen_label"] = f"há {seconds // 60}min"
+    else:
+        m["last_seen_label"] = f"há {seconds // 3600}h"
+    return m
+
+
+def _machine_diagnostics(machine_row):
+    """Diagnóstico simples para o botão Testar conexão no painel."""
+    m = _machine_status_dict(machine_row)
+    issues = []
+    warnings = []
+    if not m.get("active"):
+        issues.append("Máquina bloqueada no servidor.")
+    if not m.get("license_ok"):
+        warnings.append("Licença vencida ou bloqueada. A máquina deve pedir PIX de liberação.")
+    exp = _parse_dt_safe(m.get("license_exp"))
+    if exp and datetime.now() > exp:
+        warnings.append("Data da licença já venceu.")
+    if not m.get("token"):
+        issues.append("Máquina sem token cadastrado.")
+    if not m.get("hwid"):
+        warnings.append("Máquina ainda sem HWID salvo. Abra a máquina e clique em Salvar e Conectar.")
+    if not m.get("last_seen"):
+        issues.append("Esta máquina nunca chamou /api/machine/check.")
+    elif not m.get("online"):
+        issues.append("Sem contato recente. Verifique internet da máquina, URL do servidor e se o app está aberto.")
+    if m.get("last_error"):
+        warnings.append("Último erro informado: " + str(m.get("last_error"))[:180])
+    if not m.get("mp_token"):
+        warnings.append("Token Mercado Pago do CLIENTE não configurado. PIX de créditos pode falhar.")
+    return m, issues, warnings
+
 @app.route("/genre_covers/<path:filename>")
 def genre_cover_file(filename):
     """Serve as capas PNG dos gêneros para o painel e para a máquina."""
     return send_from_directory(GENRE_COVERS_DIR, filename)
-
-
-
-@app.route("/api/health", methods=["GET"])
-def api_health():
-    """Teste rápido para app Windows/Android saber se o servidor está vivo."""
-    return jsonify({"ok": True, "status": "online", "service": "MajuBox", "time": datetime.now().isoformat()})
 
 # ─── Funções PIX (Mercado Pago) ───────────────────────────────────────────────
 def create_pix_payment(amount, description, machine_id, access_token=None):
@@ -300,7 +330,7 @@ def create_pix_payment(amount, description, machine_id, access_token=None):
     """
     token_to_use = access_token or MP_ACCESS_TOKEN
     if not token_to_use:
-        return {"ok": False, "qr_code": "", "pix_code": "", "mp_id": "", "error": "Token MP não configurado"}
+        return {"qr_code": "", "pix_code": "", "mp_id": "", "error": "Token MP não configurado"}
 
     try:
         payment_id = str(uuid.uuid4())
@@ -328,10 +358,10 @@ def create_pix_payment(amount, description, machine_id, access_token=None):
             pt = rd.get("point_of_interaction", {}).get("transaction_data", {})
             qr_code = pt.get("qr_code_base64", "")
             pix_code = pt.get("qr_code", "")
-            return {"ok": True, "qr_code": qr_code, "pix_code": pix_code, "mp_id": mp_id}
+            return {"qr_code": qr_code, "pix_code": pix_code, "mp_id": mp_id}
     except Exception as e:
         print(f"[PIX ERROR] {e}")
-        return {"ok": False, "qr_code": "", "pix_code": "", "mp_id": "", "error": str(e)}
+        return {"qr_code": "", "pix_code": "", "mp_id": "", "error": str(e)}
 
 
 def check_pix_payment(mp_id, access_token=None):
@@ -357,176 +387,116 @@ def check_pix_payment(mp_id, access_token=None):
 
 @app.route("/api/machine/check", methods=["POST"])
 def machine_check():
-    """Máquina verifica licença, cadastra automaticamente e recebe conteúdo.
+    """Máquina verifica licença, cadastra automaticamente e recebe conteúdo."""
+    data = request.json or {}
+    token = (data.get("token") or "").strip()
+    hwid = (data.get("hwid") or "").strip()
+    name = (data.get("name") or data.get("machine_name") or "MajuBox").strip()
 
-    Versão robusta:
-    - não quebra se o banco antigo ainda estiver sem alguma coluna;
-    - cadastra automaticamente pelo HWID;
-    - retorna erro em JSON em vez de página HTML 500.
-    """
-    try:
-        data = request.json or {}
-        token = (data.get("token") or "").strip()
-        hwid = (data.get("hwid") or "").strip()
-        name = (data.get("name") or data.get("machine_name") or "MajuBox").strip()
+    with get_db() as db:
+        m = None
+        if token:
+            m = db.execute("SELECT * FROM machines WHERE token=?", (token,)).fetchone()
+        if not m and hwid:
+            m = db.execute("SELECT * FROM machines WHERE hwid=?", (hwid,)).fetchone()
 
-        def row_get(row, key, default=None):
+        # Auto cadastro se não existir
+        if not m:
+            mid = str(uuid.uuid4())[:8].upper()
+            token = secrets.token_hex(16)
+            exp = (datetime.now() + timedelta(days=3)).isoformat()
+            db.execute(
+                "INSERT INTO machines(id,name,location,token,hwid,license_ok,license_exp,admin_pass,pix_key,pix_name,pix_city,mp_token) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                (mid, name or f"MajuBox-{mid}", "", token, hwid, 1, exp, data.get("admin_password", "1234"), data.get("pix_key", ""), data.get("pix_name", ""), data.get("pix_city", ""), data.get("mp_token", ""))
+            )
+            db.commit()
+            m = db.execute("SELECT * FROM machines WHERE id=?", (mid,)).fetchone()
+        else:
+            # Atualiza dados vindos da máquina sem mexer na licença
+            updates = []
+            vals = []
+            for col, key in [("name", "name"), ("admin_pass", "admin_password"), ("pix_key", "pix_key"), ("pix_name", "pix_name"), ("pix_city", "pix_city"), ("mp_token", "mp_token"), ("app_version", "app_version")]:
+                if data.get(key) is not None:
+                    updates.append(f"{col}=?")
+                    vals.append(data.get(key) or "")
+            if hwid and not m["hwid"]:
+                updates.append("hwid=?")
+                vals.append(hwid)
+            if updates:
+                vals.append(m["id"])
+                db.execute(f"UPDATE machines SET {', '.join(updates)} WHERE id=?", vals)
+                db.commit()
+                m = db.execute("SELECT * FROM machines WHERE id=?", (m["id"],)).fetchone()
+
+        if not m or not m["active"]:
             try:
-                if row is None:
-                    return default
-                if key in row.keys():
-                    return row[key]
+                if m:
+                    db.execute("UPDATE machines SET last_seen=datetime('now'), last_ip=?, last_user_agent=?, last_error=? WHERE id=?",
+                               (request.headers.get('X-Forwarded-For', request.remote_addr), request.headers.get('User-Agent', ''), 'Máquina bloqueada ou inativa', m['id']))
+                    db.commit()
             except Exception:
                 pass
-            return default
+            return jsonify({"ok": False, "error": "Maquina bloqueada ou nao encontrada"}), 403
 
-        def table_cols(db, table):
-            return [r[1] for r in db.execute(f"PRAGMA table_info({table})").fetchall()]
+        # Heartbeat: toda vez que a máquina sincroniza, ela fica online no painel.
+        db.execute("UPDATE machines SET last_seen=datetime('now'), last_ip=?, last_user_agent=?, last_error=NULL WHERE id=?",
+                   (request.headers.get('X-Forwarded-For', request.remote_addr), request.headers.get('User-Agent', ''), m['id']))
+        db.commit()
+        m = db.execute("SELECT * FROM machines WHERE id=?", (m["id"],)).fetchone()
 
-        with get_db() as db:
-            machine_cols = table_cols(db, "machines")
-
-            m = None
-            if token:
-                m = db.execute("SELECT * FROM machines WHERE token=?", (token,)).fetchone()
-            if not m and hwid and "hwid" in machine_cols:
-                m = db.execute("SELECT * FROM machines WHERE hwid=?", (hwid,)).fetchone()
-
-            # Auto cadastro se não existir
-            if not m:
-                mid = str(uuid.uuid4())[:8].upper()
-                new_token = secrets.token_hex(16)
-                exp = (datetime.now() + timedelta(days=3)).isoformat()
-
-                insert_data = {
-                    "id": mid,
-                    "name": name or f"MajuBox-{mid}",
-                    "location": "",
-                    "token": new_token,
-                    "hwid": hwid,
-                    "active": 1,
-                    "license_ok": 1,
-                    "license_exp": exp,
-                    "admin_pass": data.get("admin_password", "1234"),
-                    "pix_key": data.get("pix_key", ""),
-                    "pix_name": data.get("pix_name", ""),
-                    "pix_city": data.get("pix_city", ""),
-                    "mp_token": data.get("mp_token", ""),
-                }
-                cols = [c for c in insert_data.keys() if c in machine_cols]
-                vals = [insert_data[c] for c in cols]
-                db.execute(
-                    f"INSERT INTO machines({','.join(cols)}) VALUES({','.join(['?'] * len(cols))})",
-                    vals
-                )
-                db.commit()
-                m = db.execute("SELECT * FROM machines WHERE id=?", (mid,)).fetchone()
-            else:
-                # Atualiza dados vindos da máquina sem mexer na licença
-                updates = []
-                vals = []
-                update_map = [
-                    ("name", "name"),
-                    ("admin_pass", "admin_password"),
-                    ("pix_key", "pix_key"),
-                    ("pix_name", "pix_name"),
-                    ("pix_city", "pix_city"),
-                    ("mp_token", "mp_token"),
-                ]
-                for col, key in update_map:
-                    if col in machine_cols and data.get(key) is not None:
-                        updates.append(f"{col}=?")
-                        vals.append(data.get(key) or "")
-                if "hwid" in machine_cols and hwid and not row_get(m, "hwid", ""):
-                    updates.append("hwid=?")
-                    vals.append(hwid)
-                if updates:
-                    vals.append(row_get(m, "id"))
-                    db.execute(f"UPDATE machines SET {', '.join(updates)} WHERE id=?", vals)
+        license_ok = bool(m["license_ok"])
+        license_exp = m["license_exp"]
+        if license_exp:
+            try:
+                exp_dt = datetime.fromisoformat(license_exp)
+                if datetime.now() > exp_dt:
+                    db.execute("UPDATE machines SET license_ok=0 WHERE id=?", (m["id"],))
                     db.commit()
-                    m = db.execute("SELECT * FROM machines WHERE id=?", (row_get(m, "id"),)).fetchone()
+                    license_ok = False
+            except Exception:
+                pass
 
-            if not m or not bool(row_get(m, "active", 1)):
-                return jsonify({"ok": False, "error": "Maquina bloqueada ou nao encontrada"}), 403
+        genres = [dict(g) for g in db.execute("SELECT * FROM genres ORDER BY sort_order").fetchall()]
+        for g in genres:
+            songs = [dict(p) for p in db.execute("""
+                SELECT p.*, d.name AS dvd_name, d.cover_url AS dvd_cover
+                FROM playlists p
+                LEFT JOIN dvds d ON d.id = p.dvd_id
+                WHERE p.genre_id=?
+                ORDER BY COALESCE(d.sort_order, 0), p.sort_order, p.id
+            """, (g["id"],)).fetchall()]
+            g["playlists"] = songs
 
-            license_ok = bool(row_get(m, "license_ok", 1))
-            license_exp = row_get(m, "license_exp", "")
-            if license_exp:
-                try:
-                    exp_dt = datetime.fromisoformat(license_exp)
-                    if datetime.now() > exp_dt:
-                        if "license_ok" in machine_cols:
-                            db.execute("UPDATE machines SET license_ok=0 WHERE id=?", (row_get(m, "id"),))
-                            db.commit()
-                        license_ok = False
-                except Exception:
-                    pass
+        base_url = request.host_url.rstrip("/")
+        for g in genres:
+            if g.get("cover_url") and str(g["cover_url"]).startswith("/"):
+                g["cover_url"] = base_url + g["cover_url"]
+            for p in g.get("playlists", []):
+                if p.get("dvd_cover") and str(p["dvd_cover"]).startswith("/"):
+                    p["dvd_cover"] = base_url + p["dvd_cover"]
+                if p.get("cover_url") and str(p["cover_url"]).startswith("/"):
+                    p["cover_url"] = base_url + p["cover_url"]
 
-            genres = [dict(g) for g in db.execute("SELECT * FROM genres ORDER BY sort_order").fetchall()]
-            for g in genres:
-                songs = [dict(p) for p in db.execute("""
-                    SELECT p.*, d.name AS dvd_name, d.cover_url AS dvd_cover
-                    FROM playlists p
-                    LEFT JOIN dvds d ON d.id = p.dvd_id
-                    WHERE p.genre_id=?
-                    ORDER BY COALESCE(d.sort_order, 0), p.sort_order, p.id
-                """, (g["id"],)).fetchall()]
-                g["playlists"] = songs
+        pix_data = None
+        if not license_ok:
+            pix_data = _get_or_create_license_pix(m["id"], db)
 
-            base_url = request.host_url.rstrip("/")
-            for g in genres:
-                if g.get("cover_url") and str(g["cover_url"]).startswith("/"):
-                    g["cover_url"] = base_url + g["cover_url"]
-                for p in g.get("playlists", []):
-                    if p.get("dvd_cover") and str(p["dvd_cover"]).startswith("/"):
-                        p["dvd_cover"] = base_url + p["dvd_cover"]
-                    if p.get("cover_url") and str(p["cover_url"]).startswith("/"):
-                        p["cover_url"] = base_url + p["cover_url"]
-
-            pix_data = None
-            if not license_ok:
-                pix_data = _get_or_create_license_pix(row_get(m, "id"), db)
-
-            return jsonify({
-                "ok": True,
-                "license_ok": license_ok,
-                "license_exp": license_exp,
-                "machine_name": row_get(m, "name", name),
-                "machine_id": row_get(m, "id"),
-                "token": row_get(m, "token", token),
-                "genres": genres,
-                "pix": pix_data,
-                "pix_liberation": pix_data,
-                "machine_pix": {
-                    "pix_key": row_get(m, "pix_key", "") or "",
-                    "pix_name": row_get(m, "pix_name", "") or "",
-                    "pix_city": row_get(m, "pix_city", "") or "",
-                    "mp_token_configured": bool(row_get(m, "mp_token", ""))
-                }
-            })
-    except Exception as e:
-        import traceback
-        print("[MACHINE CHECK ERROR]", traceback.format_exc())
-        return jsonify({"ok": False, "error": f"Erro interno no servidor: {e}", "route": "/api/machine/check"}), 500
-
-
-# Cadastro separado: usa a mesma lógica do check, porque ele já cadastra pelo HWID.
-@app.route("/api/machine/register", methods=["POST"])
-def machine_register():
-    return machine_check()
-
-@app.route("/api/proxy/register", methods=["POST"])
-def proxy_register():
-    return machine_check()
-
-@app.route("/api/machine/config", methods=["POST"])
-def machine_config():
-    # A configuração já é salva dentro do machine_check.
-    return machine_check()
-
-@app.route("/api/proxy/config", methods=["POST"])
-def proxy_config():
-    return machine_check()
+        return jsonify({
+            "ok": True,
+            "license_ok": license_ok,
+            "license_exp": license_exp,
+            "machine_name": m["name"],
+            "machine_id": m["id"],
+            "token": m["token"],
+            "genres": genres,
+            "pix": pix_data,
+            "machine_pix": {
+                "pix_key": m["pix_key"] or "",
+                "pix_name": m["pix_name"] or "",
+                "pix_city": m["pix_city"] or "",
+                "mp_token_configured": bool(m["mp_token"])
+            }
+        })
 
 # Compatibilidade para apps antigos que ainda chamam /api/proxy/check
 @app.route("/api/proxy/check", methods=["POST"])
@@ -542,6 +512,8 @@ def machine_play():
     with get_db() as db:
         m = db.execute("SELECT id FROM machines WHERE token=?", (token,)).fetchone()
         if m:
+            db.execute("UPDATE machines SET last_seen=datetime('now'), last_ip=?, last_user_agent=?, last_error=NULL WHERE id=?",
+                       (request.headers.get('X-Forwarded-For', request.remote_addr), request.headers.get('User-Agent', ''), m["id"]))
             db.execute("INSERT INTO plays(machine_id,playlist_id) VALUES(?,?)",
                        (m["id"], data.get("playlist_id")))
             db.commit()
@@ -559,6 +531,8 @@ def machine_add_credits():
     with get_db() as db:
         m = db.execute("SELECT id FROM machines WHERE token=?", (token,)).fetchone()
         if m:
+            db.execute("UPDATE machines SET last_seen=datetime('now'), last_ip=?, last_user_agent=?, last_error=NULL WHERE id=?",
+                       (request.headers.get('X-Forwarded-For', request.remote_addr), request.headers.get('User-Agent', ''), m["id"]))
             db.execute(
                 "INSERT INTO machine_revenue_log(machine_id, amount) VALUES(?,?)",
                 (m["id"], amount)
@@ -878,6 +852,10 @@ header span { color: var(--muted); font-size: 13px; }
 .badge.red { background: #2e0d0d; color: var(--red); }
 .badge.yellow { background: #2e2a0d; color: var(--yellow); }
 .badge.blue { background: #0d1a2e; color: #3498db; }
+.status-dot { display:inline-block; width:12px; height:12px; border-radius:50%; margin-right:7px; vertical-align:middle; box-shadow:0 0 10px currentColor; }
+.status-dot.green { background: var(--green); color: var(--green); }
+.status-dot.red { background: var(--red); color: var(--red); }
+.muted-small { color: var(--muted); font-size: 11px; }
 
 .btn, button {
     background: var(--accent);
@@ -1031,7 +1009,7 @@ th { color: var(--muted); font-weight: 600; }
         <span id="machines-count" style="font-size:12px;color:var(--muted)"></span>
     </div>
     <table>
-        <thead><tr><th>Nome</th><th>Local</th><th>Licença</th><th>Admin Pass</th><th>Token</th><th>Ações</th></tr></thead>
+        <thead><tr><th>Nome</th><th>Status</th><th>Local</th><th>Licença</th><th>Admin Pass</th><th>Token</th><th>Ações</th></tr></thead>
         <tbody id="machines-tbody"></tbody>
     </table>
 </div>
@@ -1388,24 +1366,58 @@ async function loadMachines() {
     const countEl = document.getElementById('machines-count');
     if (countEl) countEl.textContent = machines.length + ' máquina(s) encontrada(s)';
     if (!machines.length) {
-        tb.innerHTML = '<tr><td colspan="6" style="color:var(--muted);padding:20px">Nenhuma máquina encontrada.</td></tr>';
+        tb.innerHTML = '<tr><td colspan="7" style="color:var(--muted);padding:20px">Nenhuma máquina encontrada.</td></tr>';
         return;
     }
-    tb.innerHTML = machines.map(m => `
+    tb.innerHTML = machines.map(m => {
+        const onlineClass = m.online ? 'green' : 'red';
+        const onlineText = m.online ? 'Online' : 'Offline';
+        const lastSeen = m.last_seen_label || 'Nunca conectou';
+        return `
         <tr>
             <td><strong>${m.name}</strong><br><span style="font-size:11px;color:var(--muted)">ID: ${m.id}</span></td>
+            <td><span class="status-dot ${onlineClass}"></span><strong>${onlineText}</strong><br><span class="muted-small">${lastSeen}</span></td>
             <td>${m.location || '-'}</td>
             <td><span class="badge ${m.license_ok ? 'green' : 'red'}">${m.license_ok ? 'Ativa' : 'Vencida'}</span></td>
             <td>${m.admin_pass || '1234'}</td>
-            <td style="font-family:monospace;font-size:11px">${m.token.substring(0, 16)}...</td>
+            <td style="font-family:monospace;font-size:11px">${(m.token || '').substring(0, 16)}...</td>
             <td>
+                <button class="btn btn-sm btn-ghost" onclick="testMachineConnection('${m.id}')">⋯ Testar</button>
                 <button class="btn btn-sm btn-ghost" onclick="showMachineReading('${m.id}')">📖 Leitura</button>
                 <button class="btn btn-sm btn-ghost" onclick="toggleLicense('${m.id}', ${m.license_ok})">${m.license_ok ? 'Bloquear' : 'Liberar'}</button>
                 <button class="btn btn-sm btn-ghost" onclick="copyToken('${m.token}')">📋</button>
                 <button class="btn btn-sm btn-ghost" onclick="resetMachinePass('${m.id}')">🔑</button>
             </td>
-        </tr>
-    `).join('');
+        </tr>`;
+    }).join('');
+}
+
+async function testMachineConnection(id) {
+    openModal('modal-machine-reading');
+    const box = document.getElementById('machine-reading-content');
+    box.innerHTML = 'Testando comunicação da máquina...';
+    const d = await api('/admin/api/machines/' + id + '/test_connection', 'POST', {});
+    if (!d.ok) {
+        box.innerHTML = '<p style="color:var(--red)">' + (d.error || 'Erro ao testar.') + '</p>';
+        return;
+    }
+    const statusColor = d.online ? 'var(--green)' : 'var(--red)';
+    box.innerHTML = `
+        <div class="card" style="margin-bottom:12px">
+            <h3><span class="status-dot ${d.online ? 'green' : 'red'}"></span>${d.machine.name} — ${d.online ? 'ONLINE' : 'OFFLINE'}</h3>
+            <p><b>Último contato:</b> ${d.last_seen_label || 'Nunca conectou'}</p>
+            <p><b>Rota usada pela máquina:</b> /api/machine/check ou /api/proxy/check</p>
+            <p><b>IP último contato:</b> ${d.machine.last_ip || '-'}</p>
+            <p><b>App/User-Agent:</b> ${d.machine.last_user_agent || '-'}</p>
+        </div>
+        <h3 style="margin:12px 0 8px;color:${statusColor}">Resultado do teste</h3>
+        <p style="color:var(--muted);font-size:13px;margin-bottom:10px">Esse teste verifica o último contato que a máquina fez com o servidor. Para ficar verde, a máquina precisa estar aberta e sincronizando.</p>
+        <table><thead><tr><th>Tipo</th><th>Mensagem</th></tr></thead><tbody>
+            ${(d.issues || []).map(x => `<tr><td style="color:var(--red)">Erro</td><td>${x}</td></tr>`).join('')}
+            ${(d.warnings || []).map(x => `<tr><td style="color:var(--yellow)">Aviso</td><td>${x}</td></tr>`).join('')}
+            ${(!d.issues.length && !d.warnings.length) ? '<tr><td style="color:var(--green)">OK</td><td>Nenhum problema encontrado.</td></tr>' : ''}
+        </tbody></table>
+    `;
 }
 
 async function showMachineReading(id) {
@@ -2026,18 +2038,41 @@ def admin_machines():
         q = (request.args.get("q") or "").strip()
         if q:
             like = f"%{q}%"
-            machines = [dict(m) for m in db.execute(
+            rows = db.execute(
                 """SELECT * FROM machines
-                   WHERE name LIKE ? OR location LIKE ? OR id LIKE ? OR token LIKE ? OR admin_pass LIKE ?
+                   WHERE name LIKE ? OR location LIKE ? OR id LIKE ? OR token LIKE ? OR admin_pass LIKE ? OR COALESCE(hwid,'') LIKE ?
                    ORDER BY created_at DESC""",
-                (like, like, like, like, like)
-            ).fetchall()]
+                (like, like, like, like, like, like)
+            ).fetchall()
         else:
-            machines = [dict(m) for m in db.execute(
+            rows = db.execute(
                 "SELECT * FROM machines ORDER BY created_at DESC"
-            ).fetchall()]
+            ).fetchall()
+        machines = [_machine_status_dict(m) for m in rows]
         return jsonify({"machines": machines})
 
+
+@app.route("/admin/api/machines/<mid>/test_connection", methods=["POST", "GET"])
+def admin_machine_test_connection(mid):
+    """Testa a comunicação pelo último heartbeat recebido da máquina."""
+    err = require_admin()
+    if err: return err
+    with get_db() as db:
+        m = db.execute("SELECT * FROM machines WHERE id=?", (mid,)).fetchone()
+        if not m:
+            return jsonify({"ok": False, "error": "Máquina não encontrada"}), 404
+        machine, issues, warnings = _machine_diagnostics(m)
+        return jsonify({
+            "ok": True,
+            "online": machine.get("online"),
+            "last_seen": machine.get("last_seen"),
+            "last_seen_label": machine.get("last_seen_label"),
+            "last_seen_seconds": machine.get("last_seen_seconds"),
+            "machine": machine,
+            "issues": issues,
+            "warnings": warnings,
+            "message": "Online" if machine.get("online") else "Offline"
+        })
 
 @app.route("/admin/api/machines/<mid>/license", methods=["POST"])
 def admin_machine_license(mid):
