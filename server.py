@@ -254,7 +254,7 @@ def create_pix_payment(amount, description, machine_id, access_token=None):
     """
     token_to_use = access_token or MP_ACCESS_TOKEN
     if not token_to_use:
-        return {"qr_code": "", "pix_code": "", "mp_id": "", "error": "Token MP não configurado"}
+        return {"ok": False, "qr_code": "", "pix_code": "", "mp_id": "", "error": "Token MP não configurado"}
 
     try:
         payment_id = str(uuid.uuid4())
@@ -282,10 +282,10 @@ def create_pix_payment(amount, description, machine_id, access_token=None):
             pt = rd.get("point_of_interaction", {}).get("transaction_data", {})
             qr_code = pt.get("qr_code_base64", "")
             pix_code = pt.get("qr_code", "")
-            return {"qr_code": qr_code, "pix_code": pix_code, "mp_id": mp_id}
+            return {"ok": True, "qr_code": qr_code, "pix_code": pix_code, "mp_id": mp_id}
     except Exception as e:
         print(f"[PIX ERROR] {e}")
-        return {"qr_code": "", "pix_code": "", "mp_id": "", "error": str(e)}
+        return {"ok": False, "qr_code": "", "pix_code": "", "mp_id": "", "error": str(e)}
 
 
 def check_pix_payment(mp_id, access_token=None):
@@ -449,6 +449,7 @@ def machine_add_credits():
     return jsonify({"ok": True, "credits_added": credits})
 
 
+@app.route("/api/machine/pix", methods=["POST"])
 @app.route("/api/machine/pix/create", methods=["POST"])
 def machine_pix_create():
     """Cria PIX Mercado Pago para comprar créditos da máquina."""
@@ -668,6 +669,103 @@ def _get_or_create_license_pix(machine_id, db):
         "copy_paste": pix["pix_code"],
         "message": f"Licença mensal: R$ {amount:.2f}. Após aprovado libera por 30 dias."
     }
+
+
+
+@app.route("/api/health", methods=["GET"])
+def api_health():
+    """Teste rápido para saber se a API está viva."""
+    return jsonify({"ok": True, "status": "ok", "service": "MajuBox", "time": datetime.now().isoformat()})
+
+
+@app.route("/api/machine/register", methods=["POST"])
+def machine_register():
+    """Cadastro explícito da máquina. Usa a mesma lógica do check para manter compatibilidade."""
+    return machine_check()
+
+
+@app.route("/api/proxy/register", methods=["POST"])
+def proxy_register():
+    """Compatibilidade para app antigo."""
+    return machine_check()
+
+
+@app.route("/api/machine/config", methods=["POST"])
+def machine_config_save():
+    """Salva configuração enviada pela máquina sem precisar esperar outro check."""
+    data = request.json or {}
+    token = (data.get("token") or "").strip()
+    hwid = (data.get("hwid") or "").strip()
+    name = (data.get("name") or data.get("machine_name") or "").strip()
+
+    with get_db() as db:
+        m = None
+        if token:
+            m = db.execute("SELECT * FROM machines WHERE token=?", (token,)).fetchone()
+        if not m and hwid:
+            m = db.execute("SELECT * FROM machines WHERE hwid=?", (hwid,)).fetchone()
+
+        if not m:
+            # Se ainda não existe, cadastra automaticamente com 3 dias demo.
+            mid = str(uuid.uuid4())[:8].upper()
+            new_token = secrets.token_hex(16)
+            exp = (datetime.now() + timedelta(days=3)).isoformat()
+            db.execute(
+                "INSERT INTO machines(id,name,location,token,hwid,license_ok,license_exp,admin_pass,pix_key,pix_name,pix_city,mp_token) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    mid,
+                    name or f"MajuBox-{mid}",
+                    data.get("location", ""),
+                    new_token,
+                    hwid,
+                    1,
+                    exp,
+                    data.get("admin_password", "1234"),
+                    data.get("pix_key", ""),
+                    data.get("pix_name", ""),
+                    data.get("pix_city", ""),
+                    data.get("mp_token", "")
+                )
+            )
+            db.commit()
+            m = db.execute("SELECT * FROM machines WHERE id=?", (mid,)).fetchone()
+        else:
+            updates = []
+            vals = []
+            mapping = [
+                ("name", "name"),
+                ("location", "location"),
+                ("admin_pass", "admin_password"),
+                ("pix_key", "pix_key"),
+                ("pix_name", "pix_name"),
+                ("pix_city", "pix_city"),
+                ("mp_token", "mp_token"),
+            ]
+            for col, key in mapping:
+                if data.get(key) is not None:
+                    updates.append(f"{col}=?")
+                    vals.append(data.get(key) or "")
+            if hwid and not m["hwid"]:
+                updates.append("hwid=?")
+                vals.append(hwid)
+            if updates:
+                vals.append(m["id"])
+                db.execute(f"UPDATE machines SET {', '.join(updates)} WHERE id=?", vals)
+                db.commit()
+                m = db.execute("SELECT * FROM machines WHERE id=?", (m["id"],)).fetchone()
+
+        return jsonify({
+            "ok": True,
+            "machine_id": m["id"],
+            "token": m["token"],
+            "license_exp": m["license_exp"],
+            "license_ok": bool(m["license_ok"]),
+        })
+
+
+@app.route("/api/proxy/config", methods=["POST"])
+def proxy_config_save():
+    return machine_config_save()
 
 
 # ─── Painel Admin ─────────────────────────────────────────────────────────────
