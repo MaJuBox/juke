@@ -7,9 +7,15 @@ import json, sqlite3, uuid, hashlib, os, threading, secrets, re
 from datetime import datetime, timedelta
 from pathlib import Path
 from flask import Flask, request, jsonify, render_template_string, redirect, url_for, session, send_from_directory
+try:
+    from flask_cors import CORS
+except Exception:
+    CORS = None
 import urllib.request, urllib.error, urllib.parse
 
 app = Flask(__name__)
+if CORS:
+    CORS(app, resources={r"/api/*": {"origins": "*"}, r"/admin/api/*": {"origins": "*"}})
 app.secret_key = os.environ.get("MAJUBOX_SECRET", secrets.token_hex(32))
 
 DB_PATH = Path(__file__).parent / "majubox.db"
@@ -35,6 +41,8 @@ DEFAULT_GENRE_COVERS = {
     "MPB": "/genre_covers/mpb.png",
     "Samba": "/genre_covers/samba.png",
     "Pop": "/genre_covers/pop.png",
+    "Eletrônica": "/genre_covers/eletronica.png",
+    "Gospel": "/genre_covers/gospel.png",
 }
 
 def _load_saved_youtube_key():
@@ -83,6 +91,7 @@ def init_db():
             name        TEXT NOT NULL,
             location    TEXT,
             token       TEXT UNIQUE NOT NULL,
+            hwid        TEXT UNIQUE,
             active      INTEGER DEFAULT 1,
             license_ok  INTEGER DEFAULT 1,
             license_exp TEXT,
@@ -90,6 +99,7 @@ def init_db():
             pix_key     TEXT,
             pix_name    TEXT,
             pix_city    TEXT,
+            mp_token    TEXT,
             created_at  TEXT DEFAULT (datetime('now'))
         );
 
@@ -131,6 +141,7 @@ def init_db():
             pix_code     TEXT,
             mp_id        TEXT,
             payment_type TEXT DEFAULT 'license',
+            credited     INTEGER DEFAULT 0,
             created_at   TEXT DEFAULT (datetime('now')),
             paid_at      TEXT
         );
@@ -163,6 +174,17 @@ def init_db():
         if "credited" not in cols:
             db.execute("ALTER TABLE payments ADD COLUMN credited INTEGER DEFAULT 0")
 
+        # Migrações seguras para bancos antigos
+        for sql in [
+            "ALTER TABLE machines ADD COLUMN hwid TEXT UNIQUE",
+            "ALTER TABLE machines ADD COLUMN mp_token TEXT",
+            "ALTER TABLE payments ADD COLUMN credited INTEGER DEFAULT 0",
+        ]:
+            try:
+                db.execute(sql)
+            except Exception:
+                pass
+
         # Gêneros padrão
         count = db.execute("SELECT COUNT(*) FROM genres").fetchone()[0]
         if count == 0:
@@ -184,6 +206,17 @@ def init_db():
                 db.execute("INSERT INTO genres(name,cover_url,sort_order) VALUES(?,?,?)",
                            (name, cover, order))
 
+        # Garante que todos os gêneros padrão existam, mesmo em banco antigo.
+        existing_names = {str(r[0]).lower(): r[0] for r in db.execute("SELECT name FROM genres").fetchall()}
+        current_max_order = db.execute("SELECT COALESCE(MAX(sort_order), 0) FROM genres").fetchone()[0] or 0
+        for genre_name in DEFAULT_GENRE_COVERS.keys():
+            if genre_name.lower() not in existing_names:
+                current_max_order += 1
+                db.execute(
+                    "INSERT INTO genres(name,cover_url,sort_order) VALUES(?,?,?)",
+                    (genre_name, DEFAULT_GENRE_COVERS.get(genre_name, ""), current_max_order)
+                )
+
         # Atualiza capas padrão dos gêneros, sem apagar capas que você já configurou.
         for genre_name, cover_path in DEFAULT_GENRE_COVERS.items():
             db.execute(
@@ -201,15 +234,19 @@ def genre_cover_file(filename):
     return send_from_directory(GENRE_COVERS_DIR, filename)
 
 # ─── Funções PIX (Mercado Pago) ───────────────────────────────────────────────
-def create_pix_payment(amount, description, machine_id):
-    """Cria pagamento PIX via API Mercado Pago"""
-    if not MP_ACCESS_TOKEN:
+def create_pix_payment(amount, description, machine_id, access_token=None):
+    """Cria pagamento PIX via API Mercado Pago.
+    Se access_token for informado, usa o token do cliente/máquina para créditos.
+    Sem access_token, usa MP_ACCESS_TOKEN do servidor para licença mensal.
+    """
+    token_to_use = access_token or MP_ACCESS_TOKEN
+    if not token_to_use:
         return {"qr_code": "", "pix_code": "", "mp_id": "", "error": "Token MP não configurado"}
 
     try:
         payment_id = str(uuid.uuid4())
         headers = {
-            "Authorization": f"Bearer {MP_ACCESS_TOKEN}",
+            "Authorization": f"Bearer {token_to_use}",
             "Content-Type": "application/json",
             "X-Idempotency-Key": payment_id
         }
@@ -238,12 +275,13 @@ def create_pix_payment(amount, description, machine_id):
         return {"qr_code": "", "pix_code": "", "mp_id": "", "error": str(e)}
 
 
-def check_pix_payment(mp_id):
+def check_pix_payment(mp_id, access_token=None):
     """Verifica se pagamento PIX foi aprovado"""
-    if not MP_ACCESS_TOKEN or not mp_id:
+    token_to_use = access_token or MP_ACCESS_TOKEN
+    if not token_to_use or not mp_id:
         return None
     try:
-        headers = {"Authorization": f"Bearer {MP_ACCESS_TOKEN}"}
+        headers = {"Authorization": f"Bearer {token_to_use}"}
         req = urllib.request.Request(
             f"https://api.mercadopago.com/v1/payments/{mp_id}",
             headers=headers
@@ -260,35 +298,63 @@ def check_pix_payment(mp_id):
 
 @app.route("/api/machine/check", methods=["POST"])
 def machine_check():
-    """Máquina verifica licença e recebe conteúdo"""
+    """Máquina verifica licença, cadastra automaticamente e recebe conteúdo."""
     data = request.json or {}
-    token = data.get("token", "")
+    token = (data.get("token") or "").strip()
+    hwid = (data.get("hwid") or "").strip()
+    name = (data.get("name") or data.get("machine_name") or "MajuBox").strip()
 
     with get_db() as db:
-        m = db.execute("SELECT * FROM machines WHERE token=? AND active=1", (token,)).fetchone()
+        m = None
+        if token:
+            m = db.execute("SELECT * FROM machines WHERE token=?", (token,)).fetchone()
+        if not m and hwid:
+            m = db.execute("SELECT * FROM machines WHERE hwid=?", (hwid,)).fetchone()
+
+        # Auto cadastro se não existir
         if not m:
-            return jsonify({"ok": False, "error": "Máquina não encontrada"}), 403
+            mid = str(uuid.uuid4())[:8].upper()
+            token = secrets.token_hex(16)
+            exp = (datetime.now() + timedelta(days=3)).isoformat()
+            db.execute(
+                "INSERT INTO machines(id,name,location,token,hwid,license_ok,license_exp,admin_pass,pix_key,pix_name,pix_city,mp_token) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                (mid, name or f"MajuBox-{mid}", "", token, hwid, 1, exp, data.get("admin_password", "1234"), data.get("pix_key", ""), data.get("pix_name", ""), data.get("pix_city", ""), data.get("mp_token", ""))
+            )
+            db.commit()
+            m = db.execute("SELECT * FROM machines WHERE id=?", (mid,)).fetchone()
+        else:
+            # Atualiza dados vindos da máquina sem mexer na licença
+            updates = []
+            vals = []
+            for col, key in [("name", "name"), ("admin_pass", "admin_password"), ("pix_key", "pix_key"), ("pix_name", "pix_name"), ("pix_city", "pix_city"), ("mp_token", "mp_token")]:
+                if data.get(key) is not None:
+                    updates.append(f"{col}=?")
+                    vals.append(data.get(key) or "")
+            if hwid and not m["hwid"]:
+                updates.append("hwid=?")
+                vals.append(hwid)
+            if updates:
+                vals.append(m["id"])
+                db.execute(f"UPDATE machines SET {', '.join(updates)} WHERE id=?", vals)
+                db.commit()
+                m = db.execute("SELECT * FROM machines WHERE id=?", (m["id"],)).fetchone()
+
+        if not m or not m["active"]:
+            return jsonify({"ok": False, "error": "Maquina bloqueada ou nao encontrada"}), 403
 
         license_ok = bool(m["license_ok"])
         license_exp = m["license_exp"]
-
         if license_exp:
             try:
-                exp = datetime.fromisoformat(license_exp)
-                if datetime.now() > exp:
+                exp_dt = datetime.fromisoformat(license_exp)
+                if datetime.now() > exp_dt:
                     db.execute("UPDATE machines SET license_ok=0 WHERE id=?", (m["id"],))
                     db.commit()
                     license_ok = False
-            except:
+            except Exception:
                 pass
 
-        # Busca gêneros + playlists em formato que a máquina entende.
-        # IMPORTANTE: o app da máquina espera g["playlists"] como LISTA DE MÚSICAS,
-        # não como lista de DVDs. Por isso retornamos as músicas já com dvd_name/dvd_cover.
-        genres = [dict(g) for g in db.execute(
-            "SELECT * FROM genres ORDER BY sort_order"
-        ).fetchall()]
-
+        genres = [dict(g) for g in db.execute("SELECT * FROM genres ORDER BY sort_order").fetchall()]
         for g in genres:
             songs = [dict(p) for p in db.execute("""
                 SELECT p.*, d.name AS dvd_name, d.cover_url AS dvd_cover
@@ -299,7 +365,6 @@ def machine_check():
             """, (g["id"],)).fetchall()]
             g["playlists"] = songs
 
-        # Transforma capas locais em URL completa para a máquina baixar corretamente.
         base_url = request.host_url.rstrip("/")
         for g in genres:
             if g.get("cover_url") and str(g["cover_url"]).startswith("/"):
@@ -310,30 +375,34 @@ def machine_check():
                 if p.get("cover_url") and str(p["cover_url"]).startswith("/"):
                     p["cover_url"] = base_url + p["cover_url"]
 
-        # PIX data
         pix_data = None
         if not license_ok:
             pix_data = _get_or_create_license_pix(m["id"], db)
 
-        # PIX config da máquina (para tela de créditos PIX)
-        machine_pix = {
-            "pix_key": m["pix_key"] or "",
-            "pix_name": m["pix_name"] or "",
-            "pix_city": m["pix_city"] or "",
-        }
-
         return jsonify({
             "ok": True,
             "license_ok": license_ok,
+            "license_exp": license_exp,
             "machine_name": m["name"],
             "machine_id": m["id"],
+            "token": m["token"],
             "genres": genres,
             "pix": pix_data,
-            "machine_pix": machine_pix
+            "machine_pix": {
+                "pix_key": m["pix_key"] or "",
+                "pix_name": m["pix_name"] or "",
+                "pix_city": m["pix_city"] or "",
+                "mp_token_configured": bool(m["mp_token"])
+            }
         })
 
+# Compatibilidade para apps antigos que ainda chamam /api/proxy/check
+@app.route("/api/proxy/check", methods=["POST"])
+def proxy_check():
+    return machine_check()
 
 @app.route("/api/machine/play", methods=["POST"])
+
 def machine_play():
     """Registra música tocada"""
     data = request.json or {}
@@ -380,19 +449,20 @@ def machine_pix_create():
     credits = int(data.get("credits") or round(amount * 2))
     credits = max(1, credits)
 
-    if not MP_ACCESS_TOKEN:
-        return jsonify({
-            "ok": False,
-            "error": "Token Mercado Pago nao configurado. Configure MP_ACCESS_TOKEN no painel/servidor."
-        }), 400
-
     with get_db() as db:
         m = db.execute("SELECT * FROM machines WHERE token=? AND active=1", (token,)).fetchone()
         if not m:
             return jsonify({"ok": False, "error": "Maquina nao encontrada"}), 403
 
+        client_mp_token = (data.get("mp_token") or m["mp_token"] or "").strip()
+        if client_mp_token and client_mp_token != (m["mp_token"] or ""):
+            db.execute("UPDATE machines SET mp_token=? WHERE id=?", (client_mp_token, m["id"]))
+            db.commit()
+        if not client_mp_token:
+            return jsonify({"ok": False, "error": "Token Mercado Pago do CLIENTE nao configurado na maquina (F1)."}), 400
+
         payment_id = str(uuid.uuid4())
-        pix = create_pix_payment(amount, f"MajuBox - {credits} creditos - {m['name']}", m["id"])
+        pix = create_pix_payment(amount, f"MajuBox - {credits} creditos - {m['name']}", m["id"], access_token=client_mp_token)
         if pix.get("error") or not pix.get("mp_id"):
             return jsonify({"ok": False, "error": pix.get("error", "Erro ao criar PIX no Mercado Pago")}), 400
 
@@ -433,7 +503,8 @@ def machine_pix_status():
         if not payment:
             return jsonify({"ok": False, "error": "Pagamento nao encontrado"}), 404
 
-        mp_status = check_pix_payment(payment["mp_id"]) or payment["status"] or "pending"
+        client_mp_token = (data.get("mp_token") or m["mp_token"] or "").strip()
+        mp_status = check_pix_payment(payment["mp_id"], access_token=client_mp_token) or payment["status"] or "pending"
         credits_added = 0
 
         if mp_status == "approved":
@@ -475,6 +546,17 @@ def machine_pix_status():
             "amount": float(payment["amount"] or 0)
         })
 
+
+
+# Compatibilidade para apps antigos que ainda chamam /api/proxy/pix...
+@app.route("/api/proxy/pix", methods=["POST"])
+@app.route("/api/proxy/pix/create", methods=["POST"])
+def proxy_pix_create():
+    return machine_pix_create()
+
+@app.route("/api/proxy/pix/status", methods=["POST"])
+def proxy_pix_status():
+    return machine_pix_status()
 
 @app.route("/api/pix/webhook", methods=["POST"])
 def pix_webhook():
@@ -2228,6 +2310,155 @@ def admin_playlists_bulk():
     return jsonify({"ok": True, "inserted": inserted, "skipped": skipped})
 
 
+
+
+def _absolute_url_for_machine(value):
+    """Transforma /genre_covers/... em URL completa para Windows/Android."""
+    if not value:
+        return ""
+    value = str(value)
+    if value.startswith("http://") or value.startswith("https://"):
+        return value
+    if value.startswith("/"):
+        return request.host_url.rstrip("/") + value
+    return value
+
+
+def _import_youtube_channel_to_db(genre_id, channel_url, dvd_name_input="", artist_input="", mode="jukebox", max_minutes=7, max_results=200):
+    """Importa canal do YouTube para um DVD global. Usado pelo painel e pelas máquinas."""
+    if not genre_id:
+        return {"ok": False, "error": "Escolha um gênero."}
+    if not channel_url:
+        return {"ok": False, "error": "Informe o link, @handle ou ID do canal."}
+
+    try:
+        max_minutes = float(max_minutes or 7)
+        max_results = int(max_results or 200)
+    except Exception:
+        return {"ok": False, "error": "Limite de minutos ou quantidade inválida."}
+
+    max_minutes = max(1, min(30, max_minutes))
+    max_results = max(1, min(200, max_results))
+
+    try:
+        channel = resolve_youtube_channel(channel_url)
+        videos = fetch_channel_videos(channel["uploads_playlist_id"], max_results=max_results)
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+    max_seconds = int(max_minutes * 60)
+    dvd_name = (dvd_name_input or "").strip() or channel["title"]
+    artist = (artist_input or "").strip() or channel["title"]
+
+    with get_db() as db:
+        genre = db.execute("SELECT * FROM genres WHERE id=?", (genre_id,)).fetchone()
+        if not genre:
+            return {"ok": False, "error": "Gênero não encontrado no servidor."}
+
+        # Evita duplicar o mesmo DVD com mesmo nome no mesmo gênero quando a máquina clicar duas vezes.
+        existing_dvd = db.execute(
+            "SELECT id FROM dvds WHERE genre_id=? AND LOWER(name)=LOWER(?) LIMIT 1",
+            (genre_id, dvd_name)
+        ).fetchone()
+        if existing_dvd:
+            dvd_id = existing_dvd["id"]
+            db.execute("UPDATE dvds SET cover_url=COALESCE(NULLIF(cover_url,''), ?) WHERE id=?", (channel.get("cover_url", ""), dvd_id))
+        else:
+            next_dvd_order = db.execute("SELECT COALESCE(MAX(sort_order),0)+1 FROM dvds WHERE genre_id=?", (genre_id,)).fetchone()[0] or 1
+            cur = db.execute(
+                "INSERT INTO dvds(genre_id,name,cover_url,sort_order) VALUES(?,?,?,?)",
+                (genre_id, dvd_name, channel.get("cover_url", ""), next_dvd_order)
+            )
+            dvd_id = cur.lastrowid
+
+        base_order = db.execute(
+            "SELECT COALESCE(MAX(sort_order),0) FROM playlists WHERE genre_id=? AND COALESCE(dvd_id,0)=COALESCE(?,0)",
+            (genre_id, dvd_id)
+        ).fetchone()[0] or 0
+
+        inserted = 0
+        skipped = 0
+        duplicated = 0
+        for video in videos:
+            dur = int(video.get("duration_seconds", 0) or 0)
+            if not dur or dur > max_seconds:
+                skipped += 1
+                continue
+            youtube_id = video.get("youtube_id", "").strip()
+            if not youtube_id:
+                skipped += 1
+                continue
+            exists = db.execute("SELECT id FROM playlists WHERE youtube_id=? AND dvd_id=? LIMIT 1", (youtube_id, dvd_id)).fetchone()
+            if exists:
+                duplicated += 1
+                continue
+            inserted += 1
+            db.execute(
+                "INSERT INTO playlists(genre_id,dvd_id,title,artist,youtube_id,video_url,cover_url,mode,sort_order) VALUES(?,?,?,?,?,?,?,?,?)",
+                (genre_id, dvd_id, video["title"], artist, youtube_id, f"https://www.youtube.com/watch?v={youtube_id}", video.get("cover_url", ""), mode, base_order + inserted)
+            )
+        db.commit()
+
+    return {
+        "ok": True,
+        "dvd_id": dvd_id,
+        "dvd_name": dvd_name,
+        "genre_id": genre_id,
+        "genre_name": genre["name"],
+        "inserted": inserted,
+        "skipped": skipped,
+        "duplicated": duplicated,
+        "channel_title": channel["title"],
+        "channel_cover": channel.get("cover_url", ""),
+    }
+
+
+@app.route("/api/machine/genres", methods=["POST", "GET"])
+def machine_genres_list():
+    """Lista gêneros para a máquina escolher ao adicionar DVD."""
+    with get_db() as db:
+        rows = [dict(r) for r in db.execute("SELECT id,name,cover_url,sort_order FROM genres ORDER BY sort_order,name").fetchall()]
+    for g in rows:
+        g["cover_url"] = _absolute_url_for_machine(g.get("cover_url"))
+    return jsonify({"ok": True, "genres": rows})
+
+
+@app.route("/api/machine/youtube/import_channel", methods=["POST"])
+def machine_youtube_import_channel():
+    """Permite que qualquer máquina autorizada adicione um DVD global pelo canal do YouTube.
+    Usa a YouTube API key configurada no servidor. O DVD e as músicas ficam salvos no servidor
+    e aparecem para todas as máquinas no próximo atualizar/conectar.
+    """
+    d = request.json or {}
+    token = (d.get("token") or "").strip()
+    hwid = (d.get("hwid") or "").strip()
+
+    with get_db() as db:
+        machine = None
+        if token:
+            machine = db.execute("SELECT id,active FROM machines WHERE token=?", (token,)).fetchone()
+        if not machine and hwid:
+            machine = db.execute("SELECT id,active FROM machines WHERE hwid=?", (hwid,)).fetchone()
+        if not machine or not machine["active"]:
+            return jsonify({"ok": False, "error": "Máquina não autorizada. Salve/conecte no F1 antes de adicionar DVD."}), 403
+
+    result = _import_youtube_channel_to_db(
+        genre_id=d.get("genre_id"),
+        channel_url=(d.get("channel_url") or d.get("channel_id") or "").strip(),
+        dvd_name_input=(d.get("dvd_name") or "").strip(),
+        artist_input=(d.get("artist") or "").strip(),
+        mode=d.get("mode", "jukebox") or "jukebox",
+        max_minutes=d.get("max_minutes", 7),
+        max_results=d.get("max_results", 200),
+    )
+    status = 200 if result.get("ok") else 400
+    return jsonify(result), status
+
+# Compatibilidade para app/web que use /api/proxy
+@app.route("/api/proxy/youtube/import_channel", methods=["POST"])
+def proxy_machine_youtube_import_channel():
+    return machine_youtube_import_channel()
+
 @app.route("/admin/api/youtube/import_channel", methods=["POST"])
 def admin_youtube_import_channel():
     err = require_admin()
@@ -2453,4 +2684,4 @@ if __name__ == "__main__":
     print("    ADMIN_PASSWORD  — senha do painel admin")
     print("    MP_ACCESS_TOKEN — token Mercado Pago (PIX)")
     print("=" * 55)
-    app.run(host="0.0.0.0", port=5000, debug=False)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=False)
