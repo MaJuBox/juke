@@ -15,7 +15,9 @@ import urllib.request, urllib.error, urllib.parse
 
 app = Flask(__name__)
 if CORS:
-    CORS(app, resources={r"/api/*": {"origins": "*"}, r"/admin/api/*": {"origins": "*"}})
+    # Libera CORS para TODAS as rotas e TODAS as origens
+    # Necessário para app web, Android WebView e máquina Windows acessarem a API sem bloqueio.
+    CORS(app, resources={r"/*": {"origins": "*"}})
 app.secret_key = os.environ.get("MAJUBOX_SECRET", secrets.token_hex(32))
 
 @app.errorhandler(Exception)
