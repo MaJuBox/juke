@@ -52,6 +52,25 @@ DEFAULT_GENRE_COVERS = {
     "Gospel": "/genre_covers/gospel.png",
 }
 
+# Filtro padrão para importar vídeos do YouTube
+# Bloqueia Shorts e vídeos muito longos: mínimo 2 minutos, máximo 7 minutos.
+YOUTUBE_MIN_SECONDS = 2 * 60
+YOUTUBE_MAX_SECONDS = 7 * 60
+
+def _is_probable_short_video(video):
+    """Retorna True quando parece Shorts ou fora do tempo permitido."""
+    title = str(video.get("title", "") or "").lower()
+    dur = int(video.get("duration_seconds", 0) or 0)
+    if not dur:
+        return True
+    if dur < YOUTUBE_MIN_SECONDS or dur > YOUTUBE_MAX_SECONDS:
+        return True
+    # Muitos Shorts oficiais vêm com hashtag ou palavra Shorts no título.
+    # O filtro principal continua sendo o tempo, mas isso ajuda a bloquear também.
+    if "#shorts" in title or "#short" in title or "youtube shorts" in title:
+        return True
+    return False
+
 def _load_saved_youtube_key():
     """Carrega a chave da API do YouTube salva no painel admin, se existir."""
     global YOUTUBE_API_KEY
@@ -1321,7 +1340,7 @@ th { color: var(--muted); font-weight: 600; }
     <div class="modal-box">
         <h2>📺 Importar canal do YouTube</h2>
         <p style="color:var(--muted);font-size:13px;margin-bottom:12px">
-            Cole o link do canal. O servidor pega os vídeos, descarta os maiores que 7 minutos e cria as músicas automaticamente.
+            Cole o link do canal. O servidor pega os vídeos, descarta Shorts, vídeos menores que 2 minutos e maiores que 7 minutos e cria as músicas automaticamente.
         </p>
         <label>Gênero</label>
         <select id="yc-genre"></select>
@@ -1331,8 +1350,10 @@ th { color: var(--muted); font-weight: 600; }
         <input id="yc-dvd-name" placeholder="Se vazio, usa o nome do canal">
         <label>Artista padrão (opcional)</label>
         <input id="yc-artist" placeholder="Se vazio, usa o nome do canal">
-        <label>Limite de duração em minutos</label>
-        <input id="yc-max-minutes" type="number" min="1" max="30" value="7">
+        <label>Filtro de duração</label>
+        <input id="yc-min-minutes" type="number" min="2" max="7" value="2" readonly>
+        <label>Máximo de duração em minutos</label>
+        <input id="yc-max-minutes" type="number" min="7" max="7" value="7" readonly>
         <label>Quantidade máxima de vídeos</label>
         <input id="yc-max-results" type="number" min="1" max="500" value="50">
         <label>Modo</label>
@@ -1724,6 +1745,7 @@ async function importYouTubeChannel() {
     const channelUrl = document.getElementById('yc-channel-url').value.trim();
     const dvdName = document.getElementById('yc-dvd-name').value.trim();
     const artist = document.getElementById('yc-artist').value.trim();
+    const minMinutes = document.getElementById('yc-min-minutes') ? (document.getElementById('yc-min-minutes').value || '2') : '2';
     const maxMinutes = document.getElementById('yc-max-minutes').value || '7';
     const maxResults = document.getElementById('yc-max-results').value || '50';
     const mode = document.getElementById('yc-mode').value || 'jukebox';
@@ -1749,6 +1771,7 @@ async function importYouTubeChannel() {
             channel_url: channelUrl,
             dvd_name: dvdName,
             artist: artist,
+            min_minutes: minMinutes,
             max_minutes: maxMinutes,
             max_results: maxResults,
             mode: mode
@@ -2581,7 +2604,7 @@ def _absolute_url_for_machine(value):
     return value
 
 
-def _import_youtube_channel_to_db(genre_id, channel_url, dvd_name_input="", artist_input="", mode="jukebox", max_minutes=7, max_results=200):
+def _import_youtube_channel_to_db(genre_id, channel_url, dvd_name_input="", artist_input="", mode="jukebox", min_minutes=2, max_minutes=7, max_results=200):
     """Importa canal do YouTube para um DVD global. Usado pelo painel e pelas máquinas."""
     if not genre_id:
         return {"ok": False, "error": "Escolha um gênero."}
@@ -2589,12 +2612,15 @@ def _import_youtube_channel_to_db(genre_id, channel_url, dvd_name_input="", arti
         return {"ok": False, "error": "Informe o link, @handle ou ID do canal."}
 
     try:
+        min_minutes = float(min_minutes or 2)
         max_minutes = float(max_minutes or 7)
         max_results = int(max_results or 200)
     except Exception:
         return {"ok": False, "error": "Limite de minutos ou quantidade inválida."}
 
-    max_minutes = max(1, min(30, max_minutes))
+    # Regra fixa MajuBox: bloquear Shorts e só aceitar vídeos de 2 a 7 minutos.
+    min_minutes = 2.0
+    max_minutes = 7.0
     max_results = max(1, min(200, max_results))
 
     try:
@@ -2603,7 +2629,8 @@ def _import_youtube_channel_to_db(genre_id, channel_url, dvd_name_input="", arti
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
-    max_seconds = int(max_minutes * 60)
+    min_seconds = YOUTUBE_MIN_SECONDS
+    max_seconds = YOUTUBE_MAX_SECONDS
     dvd_name = (dvd_name_input or "").strip() or channel["title"]
     artist = (artist_input or "").strip() or channel["title"]
 
@@ -2638,7 +2665,8 @@ def _import_youtube_channel_to_db(genre_id, channel_url, dvd_name_input="", arti
         duplicated = 0
         for video in videos:
             dur = int(video.get("duration_seconds", 0) or 0)
-            if not dur or dur > max_seconds:
+            # Bloqueia Shorts e vídeos fora do intervalo 2–7 minutos.
+            if _is_probable_short_video(video):
                 skipped += 1
                 continue
             youtube_id = video.get("youtube_id", "").strip()
@@ -2665,6 +2693,9 @@ def _import_youtube_channel_to_db(genre_id, channel_url, dvd_name_input="", arti
         "inserted": inserted,
         "skipped": skipped,
         "duplicated": duplicated,
+        "min_minutes": 2,
+        "max_minutes": 7,
+        "shorts_blocked": skipped,
         "channel_title": channel["title"],
         "channel_cover": channel.get("cover_url", ""),
     }
@@ -2705,6 +2736,7 @@ def machine_youtube_import_channel():
         dvd_name_input=(d.get("dvd_name") or "").strip(),
         artist_input=(d.get("artist") or "").strip(),
         mode=d.get("mode", "jukebox") or "jukebox",
+        min_minutes=d.get("min_minutes", 2),
         max_minutes=d.get("max_minutes", 7),
         max_results=d.get("max_results", 200),
     )
@@ -2727,10 +2759,15 @@ def admin_youtube_import_channel():
     artist_input = (d.get("artist") or "").strip()
     mode = d.get("mode", "jukebox") or "jukebox"
     try:
+        min_minutes = float(d.get("min_minutes", 2) or 2)
         max_minutes = float(d.get("max_minutes", 7) or 7)
-        max_results = int(d.get("max_results", 50) or 50)
+        max_results = int(d.get("max_results", 200) or 200)
     except Exception:
         return jsonify({"ok": False, "error": "Limite de minutos ou quantidade inválida."})
+    # Regra fixa MajuBox: mínimo 2 e máximo 7 minutos para bloquear Shorts.
+    min_minutes = 2.0
+    max_minutes = 7.0
+    max_results = max(1, min(200, max_results))
     if not genre_id:
         return jsonify({"ok": False, "error": "Escolha um gênero."})
     if not channel_url:
@@ -2742,7 +2779,8 @@ def admin_youtube_import_channel():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)})
 
-    max_seconds = int(max_minutes * 60)
+    min_seconds = YOUTUBE_MIN_SECONDS
+    max_seconds = YOUTUBE_MAX_SECONDS
     dvd_name = dvd_name_input or channel["title"]
     artist = artist_input or channel["title"]
 
@@ -2757,8 +2795,9 @@ def admin_youtube_import_channel():
         inserted = 0
         skipped = 0
         for video in videos:
-            dur = video.get("duration_seconds", 0)
-            if not dur or dur > max_seconds:
+            dur = int(video.get("duration_seconds", 0) or 0)
+            # Bloqueia Shorts e vídeos fora do intervalo 2–7 minutos.
+            if _is_probable_short_video(video):
                 skipped += 1
                 continue
             inserted += 1
