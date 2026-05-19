@@ -420,6 +420,8 @@ def check_pix_payment(mp_id, access_token=None):
 
 # ─── API para as Máquinas ─────────────────────────────────────────────────────
 
+@app.route("/machine/check", methods=["POST"])
+@app.route("/proxy/check", methods=["POST"])
 @app.route("/api/machine/check", methods=["POST"])
 def machine_check():
     """Máquina verifica licença, cadastra automaticamente e recebe conteúdo."""
@@ -538,11 +540,13 @@ def machine_check():
 def proxy_check():
     return machine_check()
 
+@app.route("/machine/register", methods=["POST"])
 @app.route("/api/machine/register", methods=["POST"])
 def machine_register():
     # O cadastro real é feito no check pelo HWID/token. Mantemos esta rota para Android/app antigo.
     return machine_check()
 
+@app.route("/proxy/register", methods=["POST"])
 @app.route("/api/proxy/register", methods=["POST"])
 def proxy_register():
     return machine_check()
