@@ -623,6 +623,9 @@ def machine_add_credits():
     return jsonify({"ok": True, "credits_added": credits})
 
 
+@app.route("/machine/pix", methods=["POST"])
+@app.route("/machine/pix/create", methods=["POST"])
+@app.route("/api/machine/pix", methods=["POST"])
 @app.route("/api/machine/pix/create", methods=["POST"])
 def machine_pix_create():
     """Cria PIX Mercado Pago para comprar créditos da máquina."""
@@ -671,6 +674,7 @@ def machine_pix_create():
     })
 
 
+@app.route("/machine/pix/status", methods=["POST"])
 @app.route("/api/machine/pix/status", methods=["POST"])
 def machine_pix_status():
     """Consulta PIX no Mercado Pago. Quando aprovado, libera crédito uma única vez."""
@@ -736,11 +740,14 @@ def machine_pix_status():
 
 
 # Compatibilidade para apps antigos que ainda chamam /api/proxy/pix...
+@app.route("/proxy/pix", methods=["POST"])
+@app.route("/proxy/pix/create", methods=["POST"])
 @app.route("/api/proxy/pix", methods=["POST"])
 @app.route("/api/proxy/pix/create", methods=["POST"])
 def proxy_pix_create():
     return machine_pix_create()
 
+@app.route("/proxy/pix/status", methods=["POST"])
 @app.route("/api/proxy/pix/status", methods=["POST"])
 def proxy_pix_status():
     return machine_pix_status()
@@ -2707,16 +2714,37 @@ def _import_youtube_channel_to_db(genre_id, channel_url, dvd_name_input="", arti
     }
 
 
+@app.route("/machine/genres", methods=["POST", "GET"])
+@app.route("/proxy/genres", methods=["POST", "GET"])
+@app.route("/api/proxy/genres", methods=["POST", "GET"])
 @app.route("/api/machine/genres", methods=["POST", "GET"])
 def machine_genres_list():
-    """Lista gêneros para a máquina escolher ao adicionar DVD."""
-    with get_db() as db:
-        rows = [dict(r) for r in db.execute("SELECT id,name,cover_url,sort_order FROM genres ORDER BY sort_order,name").fetchall()]
-    for g in rows:
-        g["cover_url"] = _absolute_url_for_machine(g.get("cover_url"))
-    return jsonify({"ok": True, "genres": rows})
+    """Lista gêneros com DVDs/músicas para app web, Android e Windows."""
+    try:
+        with get_db() as db:
+            rows = [dict(r) for r in db.execute("SELECT id,name,cover_url,sort_order FROM genres ORDER BY sort_order,name").fetchall()]
+            for g in rows:
+                g["cover_url"] = _absolute_url_for_machine(g.get("cover_url"))
+                songs = [dict(p) for p in db.execute("""
+                    SELECT p.*, d.name AS dvd_name, d.cover_url AS dvd_cover
+                    FROM playlists p
+                    LEFT JOIN dvds d ON d.id = p.dvd_id
+                    WHERE p.genre_id=?
+                    ORDER BY COALESCE(d.sort_order, 0), p.sort_order, p.id
+                """, (g["id"],)).fetchall()]
+                for p in songs:
+                    if p.get("dvd_cover"):
+                        p["dvd_cover"] = _absolute_url_for_machine(p.get("dvd_cover"))
+                    if p.get("cover_url"):
+                        p["cover_url"] = _absolute_url_for_machine(p.get("cover_url"))
+                g["playlists"] = songs
+        return jsonify({"ok": True, "genres": rows})
+    except Exception as e:
+        print("[ERRO /machine/genres]", e)
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
+@app.route("/machine/youtube/import_channel", methods=["POST"])
 @app.route("/api/machine/youtube/import_channel", methods=["POST"])
 def machine_youtube_import_channel():
     """Permite que qualquer máquina autorizada adicione um DVD global pelo canal do YouTube.
@@ -2750,6 +2778,7 @@ def machine_youtube_import_channel():
     return jsonify(result), status
 
 # Compatibilidade para app/web que use /api/proxy
+@app.route("/proxy/youtube/import_channel", methods=["POST"])
 @app.route("/api/proxy/youtube/import_channel", methods=["POST"])
 def proxy_machine_youtube_import_channel():
     return machine_youtube_import_channel()
