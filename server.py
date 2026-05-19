@@ -12,6 +12,7 @@ try:
 except Exception:
     CORS = None
 import urllib.request, urllib.error, urllib.parse
+from werkzeug.exceptions import HTTPException
 
 app = Flask(__name__)
 if CORS:
@@ -20,12 +21,48 @@ if CORS:
     CORS(app, resources={r"/*": {"origins": "*"}})
 app.secret_key = os.environ.get("MAJUBOX_SECRET", secrets.token_hex(32))
 
+@app.after_request
+def ensure_api_response_headers(response):
+    """Garante que app web/Android/Windows sempre recebam resposta aceitável.
+    Rotas de API nunca devem voltar corpo vazio, porque o app espera JSON.
+    """
+    try:
+        path = request.path or ""
+        if path.startswith(("/api/", "/machine", "/proxy")):
+            response.headers["Content-Type"] = response.headers.get("Content-Type") or "application/json"
+            response.headers["Access-Control-Allow-Origin"] = "*"
+            response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+            response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
+    except Exception:
+        pass
+    return response
+
+@app.errorhandler(HTTPException)
+def handle_http_exception(e):
+    """Retorna JSON também em 404/405/500 HTTP nas rotas usadas pelo app."""
+    path = request.path or ""
+    if path.startswith(("/api/", "/machine", "/proxy")):
+        return jsonify({
+            "ok": False,
+            "error": e.description or e.name,
+            "status": e.code,
+            "path": path
+        }), e.code
+    return e
+
 @app.errorhandler(Exception)
 def handle_exception(e):
+    """Nunca deixa API responder HTML ou vazio em erro interno."""
     import traceback
     print("[SERVER ERROR]", repr(e))
     traceback.print_exc()
-    return jsonify({"ok": False, "error": str(e), "type": e.__class__.__name__}), 500
+    path = request.path or ""
+    return jsonify({
+        "ok": False,
+        "error": str(e) or "Erro interno do servidor",
+        "type": e.__class__.__name__,
+        "path": path
+    }), 500
 
 DB_PATH = Path(__file__).parent / "majubox.db"
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "admin123")
