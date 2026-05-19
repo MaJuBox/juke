@@ -18,6 +18,13 @@ if CORS:
     CORS(app, resources={r"/api/*": {"origins": "*"}, r"/admin/api/*": {"origins": "*"}})
 app.secret_key = os.environ.get("MAJUBOX_SECRET", secrets.token_hex(32))
 
+@app.errorhandler(Exception)
+def handle_exception(e):
+    import traceback
+    print("[SERVER ERROR]", repr(e))
+    traceback.print_exc()
+    return jsonify({"ok": False, "error": str(e), "type": e.__class__.__name__}), 500
+
 DB_PATH = Path(__file__).parent / "majubox.db"
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "admin123")
 
@@ -194,7 +201,7 @@ def init_db():
 
         # Migrações seguras para bancos antigos
         for sql in [
-            "ALTER TABLE machines ADD COLUMN hwid TEXT UNIQUE",
+            "ALTER TABLE machines ADD COLUMN hwid TEXT",
             "ALTER TABLE machines ADD COLUMN mp_token TEXT",
             "ALTER TABLE machines ADD COLUMN last_seen TEXT",
             "ALTER TABLE machines ADD COLUMN last_ip TEXT",
@@ -202,6 +209,11 @@ def init_db():
             "ALTER TABLE machines ADD COLUMN last_error TEXT",
             "ALTER TABLE machines ADD COLUMN app_version TEXT",
             "ALTER TABLE payments ADD COLUMN credited INTEGER DEFAULT 0",
+            "ALTER TABLE payments ADD COLUMN payment_type TEXT DEFAULT 'license'",
+            "ALTER TABLE payments ADD COLUMN pix_qr TEXT",
+            "ALTER TABLE payments ADD COLUMN pix_code TEXT",
+            "ALTER TABLE payments ADD COLUMN mp_id TEXT",
+            "ALTER TABLE payments ADD COLUMN paid_at TEXT",
         ]:
             try:
                 db.execute(sql)
@@ -250,6 +262,10 @@ def init_db():
         db.commit()
 
 init_db()
+
+@app.route("/api/health", methods=["GET"])
+def api_health():
+    return jsonify({"ok": True, "status": "online", "service": "MajuBox", "time": datetime.now().isoformat()})
 
 # ─── Status online/offline das máquinas ───────────────────────────────────────
 def _parse_dt_safe(value):
@@ -330,7 +346,7 @@ def create_pix_payment(amount, description, machine_id, access_token=None):
     """
     token_to_use = access_token or MP_ACCESS_TOKEN
     if not token_to_use:
-        return {"qr_code": "", "pix_code": "", "mp_id": "", "error": "Token MP não configurado"}
+        return {"ok": False, "qr_code": "", "pix_code": "", "mp_id": "", "error": "Token MP não configurado"}
 
     try:
         payment_id = str(uuid.uuid4())
@@ -358,10 +374,10 @@ def create_pix_payment(amount, description, machine_id, access_token=None):
             pt = rd.get("point_of_interaction", {}).get("transaction_data", {})
             qr_code = pt.get("qr_code_base64", "")
             pix_code = pt.get("qr_code", "")
-            return {"qr_code": qr_code, "pix_code": pix_code, "mp_id": mp_id}
+            return {"ok": True, "qr_code": qr_code, "pix_code": pix_code, "mp_id": mp_id}
     except Exception as e:
         print(f"[PIX ERROR] {e}")
-        return {"qr_code": "", "pix_code": "", "mp_id": "", "error": str(e)}
+        return {"ok": False, "qr_code": "", "pix_code": "", "mp_id": "", "error": str(e)}
 
 
 def check_pix_payment(mp_id, access_token=None):
@@ -407,7 +423,7 @@ def machine_check():
             exp = (datetime.now() + timedelta(days=3)).isoformat()
             db.execute(
                 "INSERT INTO machines(id,name,location,token,hwid,license_ok,license_exp,admin_pass,pix_key,pix_name,pix_city,mp_token) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-                (mid, name or f"MajuBox-{mid}", "", token, hwid, 1, exp, data.get("admin_password", "1234"), data.get("pix_key", ""), data.get("pix_name", ""), data.get("pix_city", ""), data.get("mp_token", ""))
+                (mid, name or f"MajuBox-{mid}", "", token, (hwid or None), 1, exp, data.get("admin_password", "1234"), data.get("pix_key", ""), data.get("pix_name", ""), data.get("pix_city", ""), data.get("mp_token", ""))
             )
             db.commit()
             m = db.execute("SELECT * FROM machines WHERE id=?", (mid,)).fetchone()
@@ -502,6 +518,46 @@ def machine_check():
 @app.route("/api/proxy/check", methods=["POST"])
 def proxy_check():
     return machine_check()
+
+@app.route("/api/machine/register", methods=["POST"])
+def machine_register():
+    # O cadastro real é feito no check pelo HWID/token. Mantemos esta rota para Android/app antigo.
+    return machine_check()
+
+@app.route("/api/proxy/register", methods=["POST"])
+def proxy_register():
+    return machine_check()
+
+@app.route("/api/machine/config", methods=["POST"])
+def machine_config_save():
+    # Salva configurações da máquina sem quebrar se algum campo faltar.
+    data = request.json or {}
+    token = (data.get("token") or "").strip()
+    hwid = (data.get("hwid") or "").strip()
+    with get_db() as db:
+        m = None
+        if token:
+            m = db.execute("SELECT * FROM machines WHERE token=?", (token,)).fetchone()
+        if not m and hwid:
+            m = db.execute("SELECT * FROM machines WHERE hwid=?", (hwid,)).fetchone()
+        if not m:
+            return jsonify({"ok": False, "error": "Maquina nao encontrada para salvar config"}), 404
+        updates=[]; vals=[]
+        for col, key in [("name","name"),("admin_pass","admin_password"),("pix_key","pix_key"),("pix_name","pix_name"),("pix_city","pix_city"),("mp_token","mp_token"),("app_version","app_version")]:
+            if key in data:
+                updates.append(f"{col}=?"); vals.append(data.get(key) or "")
+        updates.append("last_seen=datetime('now')")
+        updates.append("last_ip=?"); vals.append(request.headers.get('X-Forwarded-For', request.remote_addr))
+        updates.append("last_user_agent=?"); vals.append(request.headers.get('User-Agent', ''))
+        if updates:
+            vals.append(m["id"])
+            db.execute(f"UPDATE machines SET {', '.join(updates)} WHERE id=?", vals)
+            db.commit()
+    return jsonify({"ok": True})
+
+@app.route("/api/proxy/config", methods=["POST"])
+def proxy_config_save():
+    return machine_config_save()
 
 @app.route("/api/machine/play", methods=["POST"])
 
