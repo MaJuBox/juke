@@ -2838,9 +2838,14 @@ def _import_youtube_channel_to_db(genre_id, channel_url, dvd_name_input="", arti
     }
 
 
-@app.route("/api/machine/genres", methods=["POST", "GET"])
+@app.route("/machine/genres", methods=["POST", "GET", "OPTIONS"])
+@app.route("/proxy/genres", methods=["POST", "GET", "OPTIONS"])
+@app.route("/api/proxy/genres", methods=["POST", "GET", "OPTIONS"])
+@app.route("/api/machine/genres", methods=["POST", "GET", "OPTIONS"])
 def machine_genres_list():
     """Lista gêneros para a máquina escolher ao adicionar DVD."""
+    if request.method == "OPTIONS":
+        return jsonify({"ok": True})
     with get_db() as db:
         rows = [dict(r) for r in db.execute("SELECT id,name,cover_url,sort_order FROM genres ORDER BY sort_order,name").fetchall()]
     for g in rows:
@@ -2848,7 +2853,9 @@ def machine_genres_list():
     return jsonify({"ok": True, "genres": rows})
 
 
-@app.route("/api/machine/youtube/import_channel", methods=["POST"])
+@app.route("/machine/youtube/import_channel", methods=["POST", "OPTIONS"])
+@app.route("/proxy/youtube/import_channel", methods=["POST", "OPTIONS"])
+@app.route("/api/machine/youtube/import_channel", methods=["POST", "OPTIONS"])
 def machine_youtube_import_channel():
     """Permite que qualquer máquina autorizada adicione um DVD global pelo canal do YouTube.
     Usa a YouTube API key configurada no servidor. O DVD e as músicas ficam salvos no servidor
