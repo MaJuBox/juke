@@ -6,7 +6,7 @@ Integração com API Mercado Pago para recebimento PIX
 import json, sqlite3, uuid, hashlib, os, threading, secrets, re
 from datetime import datetime, timedelta
 from pathlib import Path
-from flask import Flask, request, jsonify, render_template_string, redirect, url_for, session, send_from_directory
+from flask import Flask, request, jsonify, render_template_string, redirect, url_for, session, send_from_directory, make_response
 try:
     from flask_cors import CORS
 except Exception:
@@ -21,6 +21,18 @@ if CORS:
     CORS(app, resources={r"/*": {"origins": "*"}})
 app.secret_key = os.environ.get("MAJUBOX_SECRET", secrets.token_hex(32))
 
+
+@app.before_request
+def handle_cors_preflight_all_routes():
+    """Responde OPTIONS em JSON para o app web não tomar Network Error por CORS."""
+    if request.method == "OPTIONS":
+        resp = make_response(jsonify({"ok": True, "method": "OPTIONS"}), 200)
+        resp.headers["Access-Control-Allow-Origin"] = "*"
+        resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Requested-With, Accept"
+        resp.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
+        resp.headers["Access-Control-Max-Age"] = "86400"
+        return resp
+
 @app.after_request
 def ensure_api_response_headers(response):
     """Garante que app web/Android/Windows sempre recebam resposta aceitável.
@@ -31,7 +43,7 @@ def ensure_api_response_headers(response):
         if path.startswith(("/api/", "/machine", "/proxy")):
             response.headers["Content-Type"] = response.headers.get("Content-Type") or "application/json"
             response.headers["Access-Control-Allow-Origin"] = "*"
-            response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+            response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Requested-With, Accept"
             response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
     except Exception:
         pass
@@ -459,9 +471,10 @@ def check_pix_payment(mp_id, access_token=None):
 
 # ─── API para as Máquinas ─────────────────────────────────────────────────────
 
-@app.route("/machine/check", methods=["POST"])
-@app.route("/proxy/check", methods=["POST"])
-@app.route("/api/machine/check", methods=["POST"])
+@app.route("/machine/check", methods=["POST", "OPTIONS"])
+@app.route("/proxy/check", methods=["POST", "OPTIONS"])
+@app.route("/api/machine/check", methods=["POST", "OPTIONS"])
+@app.route("/api/proxy/check", methods=["POST", "OPTIONS"])
 def machine_check():
     """Máquina verifica licença, cadastra automaticamente e recebe conteúdo."""
     data = request.json or {}
@@ -2751,10 +2764,10 @@ def _import_youtube_channel_to_db(genre_id, channel_url, dvd_name_input="", arti
     }
 
 
-@app.route("/machine/genres", methods=["POST", "GET"])
-@app.route("/proxy/genres", methods=["POST", "GET"])
-@app.route("/api/proxy/genres", methods=["POST", "GET"])
-@app.route("/api/machine/genres", methods=["POST", "GET"])
+@app.route("/machine/genres", methods=["POST", "GET", "OPTIONS"])
+@app.route("/proxy/genres", methods=["POST", "GET", "OPTIONS"])
+@app.route("/api/proxy/genres", methods=["POST", "GET", "OPTIONS"])
+@app.route("/api/machine/genres", methods=["POST", "GET", "OPTIONS"])
 def machine_genres_list():
     """Lista gêneros com DVDs/músicas para app web, Android e Windows."""
     try:
