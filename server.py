@@ -7,41 +7,73 @@ import json, sqlite3, uuid, hashlib, os, threading, secrets, re
 from datetime import datetime, timedelta
 from pathlib import Path
 from flask import Flask, request, jsonify, render_template_string, redirect, url_for, session, send_from_directory
-from werkzeug.exceptions import HTTPException
 try:
     from flask_cors import CORS
 except Exception:
     CORS = None
 import urllib.request, urllib.error, urllib.parse
+from werkzeug.exceptions import HTTPException
 
 app = Flask(__name__)
 if CORS:
-    CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=False)
+    # Libera CORS para TODAS as rotas e TODAS as origens
+    # Necessário para app web, Android WebView e máquina Windows acessarem a API sem bloqueio.
+    CORS(app, resources={r"/*": {"origins": "*"}})
 app.secret_key = os.environ.get("MAJUBOX_SECRET", secrets.token_hex(32))
+
+@app.after_request
+def ensure_api_response_headers(response):
+    """Garante que app web/Android/Windows sempre recebam resposta aceitável.
+    Rotas de API nunca devem voltar corpo vazio, porque o app espera JSON.
+    """
+    try:
+        path = request.path or ""
+        if path.startswith(("/api/", "/machine", "/proxy")):
+            response.headers["Content-Type"] = response.headers.get("Content-Type") or "application/json"
+            response.headers["Access-Control-Allow-Origin"] = "*"
+            response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+            response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
+    except Exception:
+        pass
+    return response
+
+@app.errorhandler(HTTPException)
+def handle_http_exception(e):
+    """Retorna JSON também em 404/405/500 HTTP nas rotas usadas pelo app."""
+    path = request.path or ""
+    if path.startswith(("/api/", "/machine", "/proxy")):
+        return jsonify({
+            "ok": False,
+            "error": e.description or e.name,
+            "status": e.code,
+            "path": path
+        }), e.code
+    return e
 
 @app.errorhandler(Exception)
 def handle_exception(e):
-    if isinstance(e, HTTPException):
-        if request.path.startswith('/api/') or request.path.startswith('/machine') or request.path.startswith('/proxy'):
-            return jsonify({"ok": False, "error": e.description, "status_code": e.code, "path": request.path}), e.code
-        return e
+    """Nunca deixa API responder HTML ou vazio em erro interno."""
     import traceback
     print("[SERVER ERROR]", repr(e))
     traceback.print_exc()
-    return jsonify({"ok": False, "error": str(e), "type": e.__class__.__name__}), 500
+    path = request.path or ""
+    return jsonify({
+        "ok": False,
+        "error": str(e) or "Erro interno do servidor",
+        "type": e.__class__.__name__,
+        "path": path
+    }), 500
 
-DATA_DIR = Path(os.environ.get("DATA_DIR", os.environ.get("RENDER_DISK_PATH", str(Path(__file__).parent))))
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-DB_PATH = Path(os.environ.get("DB_PATH", str(DATA_DIR / "majubox.db")))
+DB_PATH = Path(__file__).parent / "majubox.db"
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "admin123")
 
 # ─── Mercado Pago ─────────────────────────────────────────────────────────────
 MP_ACCESS_TOKEN = os.environ.get("MP_ACCESS_TOKEN", "")
-PIX_CONFIG_PATH = Path(os.environ.get("PIX_CONFIG_PATH", str(DATA_DIR / "pix_config.json")))
-YOUTUBE_CONFIG_PATH = Path(os.environ.get("YOUTUBE_CONFIG_PATH", str(DATA_DIR / "youtube_config.json")))
+PIX_CONFIG_PATH = Path(__file__).parent / "pix_config.json"
+YOUTUBE_CONFIG_PATH = Path(__file__).parent / "youtube_config.json"
 YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY", "")
 
-GENRE_COVERS_DIR = Path(os.environ.get("GENRE_COVERS_DIR", str(DATA_DIR / "genre_covers")))
+GENRE_COVERS_DIR = Path(__file__).parent / "genre_covers"
 GENRE_COVERS_DIR.mkdir(exist_ok=True)
 
 DEFAULT_GENRE_COVERS = {
@@ -218,21 +250,6 @@ def init_db():
             amount       REAL DEFAULT 0,
             recorded_at  TEXT DEFAULT (datetime('now'))
         );
-
-        CREATE TABLE IF NOT EXISTS terms_acceptance (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            machine_id      TEXT,
-            hwid            TEXT,
-            token           TEXT,
-            machine_name    TEXT,
-            terms_version   TEXT,
-            app_version     TEXT,
-            accepted_at     TEXT,
-            terms_hash      TEXT,
-            ip              TEXT,
-            user_agent      TEXT,
-            created_at      TEXT DEFAULT (datetime('now'))
-        );
         """)
 
         # Migração: versões antigas do banco podem não ter a coluna credited.
@@ -255,8 +272,6 @@ def init_db():
             "ALTER TABLE payments ADD COLUMN pix_code TEXT",
             "ALTER TABLE payments ADD COLUMN mp_id TEXT",
             "ALTER TABLE payments ADD COLUMN paid_at TEXT",
-            "ALTER TABLE terms_acceptance ADD COLUMN terms_hash TEXT",
-            "ALTER TABLE terms_acceptance ADD COLUMN user_agent TEXT",
         ]:
             try:
                 db.execute(sql)
@@ -326,9 +341,30 @@ def _parse_dt_safe(value):
             return None
 
 
+def _machine_public_id(machine_row):
+    """ID que aparece para o cliente: usa o HWID/Hardware ID da máquina.
+
+    O banco continua usando m["id"] por dentro para não quebrar ações antigas
+    como bloquear, testar e leitura. Mas no painel e nas respostas para app,
+    o ID mostrado passa a ser o mesmo que aparece na máquina/web.
+    """
+    try:
+        hwid = (machine_row["hwid"] if hasattr(machine_row, "keys") else machine_row.get("hwid")) or ""
+        internal_id = (machine_row["id"] if hasattr(machine_row, "keys") else machine_row.get("id")) or ""
+    except Exception:
+        hwid = ""
+        internal_id = ""
+    hwid = str(hwid).strip()
+    return hwid or str(internal_id).strip()
+
+
 def _machine_status_dict(machine_row, online_limit_seconds=90):
     """Define bolinha verde/vermelha conforme último contato da máquina."""
     m = dict(machine_row)
+    public_id = _machine_public_id(m)
+    m["public_id"] = public_id
+    m["display_id"] = public_id
+    m["server_id"] = m.get("id")
     last_dt = _parse_dt_safe(m.get("last_seen"))
     if last_dt:
         seconds = max(0, int((datetime.utcnow() - last_dt).total_seconds()))
@@ -547,7 +583,9 @@ def machine_check():
             "license_ok": license_ok,
             "license_exp": license_exp,
             "machine_name": m["name"],
-            "machine_id": m["id"],
+            "machine_id": _machine_public_id(m),
+            "server_machine_id": m["id"],
+            "hwid": m["hwid"] or "",
             "token": m["token"],
             "genres": genres,
             "pix": pix_data,
@@ -645,6 +683,9 @@ def machine_add_credits():
     return jsonify({"ok": True, "credits_added": credits})
 
 
+@app.route("/machine/pix", methods=["POST"])
+@app.route("/machine/pix/create", methods=["POST"])
+@app.route("/api/machine/pix", methods=["POST"])
 @app.route("/api/machine/pix/create", methods=["POST"])
 def machine_pix_create():
     """Cria PIX Mercado Pago para comprar créditos da máquina."""
@@ -693,6 +734,7 @@ def machine_pix_create():
     })
 
 
+@app.route("/machine/pix/status", methods=["POST"])
 @app.route("/api/machine/pix/status", methods=["POST"])
 def machine_pix_status():
     """Consulta PIX no Mercado Pago. Quando aprovado, libera crédito uma única vez."""
@@ -758,11 +800,14 @@ def machine_pix_status():
 
 
 # Compatibilidade para apps antigos que ainda chamam /api/proxy/pix...
+@app.route("/proxy/pix", methods=["POST"])
+@app.route("/proxy/pix/create", methods=["POST"])
 @app.route("/api/proxy/pix", methods=["POST"])
 @app.route("/api/proxy/pix/create", methods=["POST"])
 def proxy_pix_create():
     return machine_pix_create()
 
+@app.route("/proxy/pix/status", methods=["POST"])
 @app.route("/api/proxy/pix/status", methods=["POST"])
 def proxy_pix_status():
     return machine_pix_status()
@@ -865,115 +910,6 @@ def _get_or_create_license_pix(machine_id, db):
         "message": f"Licença mensal: R$ {amount:.2f}. Após aprovado libera por 30 dias."
     }
 
-
-
-
-# ─── Termos de Uso / Contrato de Licença ─────────────────────────────────────
-TERMS_VERSION = os.environ.get("TERMS_VERSION", "1.0")
-
-TERMS_TEXT = """TERMOS DE USO E CONTRATO DE LICENÇA MAJUBOX
-
-1. O MajuBox é um sistema de frontend, gerenciamento, organização e reprodução de conteúdos configurados pelo próprio cliente.
-2. A licença concede direito de uso do software pelo prazo contratado e não transfere propriedade do código-fonte.
-3. O cliente é o único responsável pelos canais, vídeos, músicas, imagens, capas, nomes, marcas, playlists, DVDs, links, chaves de API e conteúdos cadastrados.
-4. O cliente declara possuir autorização, licença ou direito legal para usar todo conteúdo inserido no sistema.
-5. A fornecedora do MajuBox não fornece músicas, vídeos, filmes, imagens protegidas, canais de terceiros ou conteúdos protegidos.
-6. Reclamações, denúncias, notificações ou cobranças por uso indevido de conteúdo serão responsabilidade exclusiva do cliente.
-7. O cliente deverá remover imediatamente qualquer conteúdo questionado por terceiros.
-8. A licença pode ser mensal, online e vinculada à máquina cadastrada, com validação no servidor.
-9. A fornecedora poderá bloquear a licença em caso de falta de pagamento, fraude, violação dos termos ou uso indevido.
-10. Ao aceitar eletronicamente, o cliente confirma que leu, entendeu e concorda com estes termos."""
-
-def _find_machine_for_terms(db, token, hwid):
-    if token:
-        m = db.execute("SELECT * FROM machines WHERE token=?", (token,)).fetchone()
-        if m:
-            return m
-    if hwid:
-        m = db.execute("SELECT * FROM machines WHERE hwid=?", (hwid,)).fetchone()
-        if m:
-            return m
-    return None
-
-@app.route("/machine/terms", methods=["GET", "OPTIONS"])
-@app.route("/api/machine/terms", methods=["GET", "OPTIONS"])
-@app.route("/proxy/terms", methods=["GET", "OPTIONS"])
-@app.route("/api/proxy/terms", methods=["GET", "OPTIONS"])
-def machine_terms_text():
-    if request.method == "OPTIONS":
-        return jsonify({"ok": True})
-    return jsonify({"ok": True, "terms_version": TERMS_VERSION, "text": TERMS_TEXT})
-
-@app.route("/machine/terms/accept", methods=["POST", "OPTIONS"])
-@app.route("/api/machine/terms/accept", methods=["POST", "OPTIONS"])
-@app.route("/proxy/terms/accept", methods=["POST", "OPTIONS"])
-@app.route("/api/proxy/terms/accept", methods=["POST", "OPTIONS"])
-def machine_terms_accept():
-    if request.method == "OPTIONS":
-        return jsonify({"ok": True})
-
-    data = request.get_json(silent=True) or {}
-    hwid = str(data.get("hwid") or "").strip()
-    token = str(data.get("token") or "").strip()
-    machine_name = str(data.get("machine_name") or data.get("name") or "").strip()
-    terms_version = str(data.get("terms_version") or TERMS_VERSION).strip()
-    app_version = str(data.get("app_version") or "").strip()
-    accepted_at = str(data.get("accepted_at") or datetime.now().isoformat()).strip()
-    terms_hash = str(data.get("terms_hash") or ("TERMS_VERSION_" + terms_version)).strip()
-    ip = (request.headers.get("X-Forwarded-For") or request.remote_addr or "").split(",")[0].strip()
-    user_agent = request.headers.get("User-Agent", "")[:500]
-
-    if not hwid and not token:
-        return jsonify({"ok": False, "error": "HWID ou token obrigatório para registrar aceite."}), 400
-
-    with get_db() as db:
-        db.execute("""
-            CREATE TABLE IF NOT EXISTS terms_acceptance (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                machine_id TEXT,
-                hwid TEXT,
-                token TEXT,
-                machine_name TEXT,
-                terms_version TEXT,
-                app_version TEXT,
-                accepted_at TEXT,
-                terms_hash TEXT,
-                ip TEXT,
-                user_agent TEXT,
-                created_at TEXT DEFAULT (datetime('now'))
-            )
-        """)
-        m = _find_machine_for_terms(db, token, hwid)
-        machine_id = m["id"] if m else ""
-        if m and not machine_name:
-            machine_name = m["name"] or ""
-        db.execute("""
-            INSERT INTO terms_acceptance
-            (machine_id, hwid, token, machine_name, terms_version, app_version, accepted_at, terms_hash, ip, user_agent)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (machine_id, hwid, token, machine_name, terms_version, app_version, accepted_at, terms_hash, ip, user_agent))
-        db.commit()
-
-    return jsonify({
-        "ok": True,
-        "message": "Termos aceitos e registrados.",
-        "terms_version": terms_version,
-        "accepted_at": accepted_at
-    })
-
-@app.route("/admin/api/terms_acceptance", methods=["GET"])
-def admin_terms_acceptance():
-    err = require_admin()
-    if err: return err
-    with get_db() as db:
-        rows = [dict(r) for r in db.execute("""
-            SELECT ta.*, m.name AS current_machine_name
-            FROM terms_acceptance ta
-            LEFT JOIN machines m ON m.id = ta.machine_id
-            ORDER BY ta.created_at DESC
-            LIMIT 500
-        """).fetchall()]
-    return jsonify({"ok": True, "acceptances": rows})
 
 # ─── Painel Admin ─────────────────────────────────────────────────────────────
 
@@ -1589,7 +1525,7 @@ async function loadMachines() {
         const lastSeen = m.last_seen_label || 'Nunca conectou';
         return `
         <tr>
-            <td><strong>${m.name}</strong><br><span style="font-size:11px;color:var(--muted)">ID: ${m.id}</span></td>
+            <td><strong>${m.name}</strong><br><span style="font-size:11px;color:var(--muted)">ID: ${m.display_id || m.public_id || m.hwid || m.id}</span></td>
             <td><span class="status-dot ${onlineClass}"></span><strong>${onlineText}</strong><br><span class="muted-small">${lastSeen}</span></td>
             <td>${m.location || '-'}</td>
             <td><span class="badge ${m.license_ok ? 'green' : 'red'}">${m.license_ok ? 'Ativa' : 'Vencida'}</span></td>
@@ -1619,6 +1555,8 @@ async function testMachineConnection(id) {
     box.innerHTML = `
         <div class="card" style="margin-bottom:12px">
             <h3><span class="status-dot ${d.online ? 'green' : 'red'}"></span>${d.machine.name} — ${d.online ? 'ONLINE' : 'OFFLINE'}</h3>
+            <p><b>ID da máquina:</b> ${d.machine.display_id || d.machine.public_id || d.machine.hwid || d.machine.id}</p>
+            <p><b>ID interno servidor:</b> ${d.machine.server_id || d.machine.id}</p>
             <p><b>Último contato:</b> ${d.last_seen_label || 'Nunca conectou'}</p>
             <p><b>Rota usada pela máquina:</b> /api/machine/check ou /api/proxy/check</p>
             <p><b>IP último contato:</b> ${d.machine.last_ip || '-'}</p>
@@ -1655,7 +1593,8 @@ async function showMachineReading(id) {
         </div>
         <div class="card" style="margin-bottom:12px">
             <h3>${m.name}</h3>
-            <p><b>ID:</b> ${m.id} &nbsp; <b>Local:</b> ${m.location || '-'} &nbsp; <b>Licença:</b> ${m.license_ok ? 'Ativa' : 'Vencida'}</p>
+            <p><b>ID da máquina:</b> ${m.display_id || m.public_id || m.hwid || m.id} &nbsp; <b>ID interno servidor:</b> ${m.server_id || m.id}</p>
+            <p><b>Local:</b> ${m.location || '-'} &nbsp; <b>Licença:</b> ${m.license_ok ? 'Ativa' : 'Vencida'}</p>
             <p><b>Vence em:</b> ${m.license_exp || '-'} &nbsp; <b>Senha admin:</b> ${m.admin_pass || '1234'}</p>
             <p><b>Token:</b> <span style="font-family:monospace">${m.token}</span></p>
         </div>
@@ -2838,24 +2777,38 @@ def _import_youtube_channel_to_db(genre_id, channel_url, dvd_name_input="", arti
     }
 
 
-@app.route("/machine/genres", methods=["POST", "GET", "OPTIONS"])
-@app.route("/proxy/genres", methods=["POST", "GET", "OPTIONS"])
-@app.route("/api/proxy/genres", methods=["POST", "GET", "OPTIONS"])
-@app.route("/api/machine/genres", methods=["POST", "GET", "OPTIONS"])
+@app.route("/machine/genres", methods=["POST", "GET"])
+@app.route("/proxy/genres", methods=["POST", "GET"])
+@app.route("/api/proxy/genres", methods=["POST", "GET"])
+@app.route("/api/machine/genres", methods=["POST", "GET"])
 def machine_genres_list():
-    """Lista gêneros para a máquina escolher ao adicionar DVD."""
-    if request.method == "OPTIONS":
-        return jsonify({"ok": True})
-    with get_db() as db:
-        rows = [dict(r) for r in db.execute("SELECT id,name,cover_url,sort_order FROM genres ORDER BY sort_order,name").fetchall()]
-    for g in rows:
-        g["cover_url"] = _absolute_url_for_machine(g.get("cover_url"))
-    return jsonify({"ok": True, "genres": rows})
+    """Lista gêneros com DVDs/músicas para app web, Android e Windows."""
+    try:
+        with get_db() as db:
+            rows = [dict(r) for r in db.execute("SELECT id,name,cover_url,sort_order FROM genres ORDER BY sort_order,name").fetchall()]
+            for g in rows:
+                g["cover_url"] = _absolute_url_for_machine(g.get("cover_url"))
+                songs = [dict(p) for p in db.execute("""
+                    SELECT p.*, d.name AS dvd_name, d.cover_url AS dvd_cover
+                    FROM playlists p
+                    LEFT JOIN dvds d ON d.id = p.dvd_id
+                    WHERE p.genre_id=?
+                    ORDER BY COALESCE(d.sort_order, 0), p.sort_order, p.id
+                """, (g["id"],)).fetchall()]
+                for p in songs:
+                    if p.get("dvd_cover"):
+                        p["dvd_cover"] = _absolute_url_for_machine(p.get("dvd_cover"))
+                    if p.get("cover_url"):
+                        p["cover_url"] = _absolute_url_for_machine(p.get("cover_url"))
+                g["playlists"] = songs
+        return jsonify({"ok": True, "genres": rows})
+    except Exception as e:
+        print("[ERRO /machine/genres]", e)
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
-@app.route("/machine/youtube/import_channel", methods=["POST", "OPTIONS"])
-@app.route("/proxy/youtube/import_channel", methods=["POST", "OPTIONS"])
-@app.route("/api/machine/youtube/import_channel", methods=["POST", "OPTIONS"])
+@app.route("/machine/youtube/import_channel", methods=["POST"])
+@app.route("/api/machine/youtube/import_channel", methods=["POST"])
 def machine_youtube_import_channel():
     """Permite que qualquer máquina autorizada adicione um DVD global pelo canal do YouTube.
     Usa a YouTube API key configurada no servidor. O DVD e as músicas ficam salvos no servidor
@@ -2888,6 +2841,7 @@ def machine_youtube_import_channel():
     return jsonify(result), status
 
 # Compatibilidade para app/web que use /api/proxy
+@app.route("/proxy/youtube/import_channel", methods=["POST"])
 @app.route("/api/proxy/youtube/import_channel", methods=["POST"])
 def proxy_machine_youtube_import_channel():
     return machine_youtube_import_channel()
@@ -3115,19 +3069,6 @@ def admin_pix_config():
     config.pop("mp_token", None)
     return jsonify(config)
 
-
-
-@app.errorhandler(404)
-def handle_404(e):
-    if request.path.startswith('/api/') or request.path.startswith('/machine') or request.path.startswith('/proxy'):
-        return jsonify({"ok": False, "error": "Rota não encontrada", "path": request.path}), 404
-    return e
-
-@app.errorhandler(500)
-def handle_500(e):
-    if request.path.startswith('/api/') or request.path.startswith('/machine') or request.path.startswith('/proxy'):
-        return jsonify({"ok": False, "error": "Erro interno do servidor", "path": request.path}), 500
-    return e
 
 @app.route("/")
 def index():
