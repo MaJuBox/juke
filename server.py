@@ -6,7 +6,7 @@ Integração com API Mercado Pago para recebimento PIX
 import json, sqlite3, uuid, hashlib, os, threading, secrets, re
 from datetime import datetime, timedelta
 from pathlib import Path
-from flask import Flask, request, jsonify, render_template_string, redirect, url_for, session, send_from_directory, make_response
+from flask import Flask, request, jsonify, render_template_string, redirect, url_for, session, send_from_directory
 try:
     from flask_cors import CORS
 except Exception:
@@ -21,18 +21,6 @@ if CORS:
     CORS(app, resources={r"/*": {"origins": "*"}})
 app.secret_key = os.environ.get("MAJUBOX_SECRET", secrets.token_hex(32))
 
-
-@app.before_request
-def handle_cors_preflight_all_routes():
-    """Responde OPTIONS em JSON para o app web não tomar Network Error por CORS."""
-    if request.method == "OPTIONS":
-        resp = make_response(jsonify({"ok": True, "method": "OPTIONS"}), 200)
-        resp.headers["Access-Control-Allow-Origin"] = "*"
-        resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Requested-With, Accept"
-        resp.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
-        resp.headers["Access-Control-Max-Age"] = "86400"
-        return resp
-
 @app.after_request
 def ensure_api_response_headers(response):
     """Garante que app web/Android/Windows sempre recebam resposta aceitável.
@@ -43,7 +31,7 @@ def ensure_api_response_headers(response):
         if path.startswith(("/api/", "/machine", "/proxy")):
             response.headers["Content-Type"] = response.headers.get("Content-Type") or "application/json"
             response.headers["Access-Control-Allow-Origin"] = "*"
-            response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Requested-With, Accept"
+            response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
             response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
     except Exception:
         pass
@@ -353,9 +341,30 @@ def _parse_dt_safe(value):
             return None
 
 
+def _machine_public_id(machine_row):
+    """ID que aparece para o cliente: usa o HWID/Hardware ID da máquina.
+
+    O banco continua usando m["id"] por dentro para não quebrar ações antigas
+    como bloquear, testar e leitura. Mas no painel e nas respostas para app,
+    o ID mostrado passa a ser o mesmo que aparece na máquina/web.
+    """
+    try:
+        hwid = (machine_row["hwid"] if hasattr(machine_row, "keys") else machine_row.get("hwid")) or ""
+        internal_id = (machine_row["id"] if hasattr(machine_row, "keys") else machine_row.get("id")) or ""
+    except Exception:
+        hwid = ""
+        internal_id = ""
+    hwid = str(hwid).strip()
+    return hwid or str(internal_id).strip()
+
+
 def _machine_status_dict(machine_row, online_limit_seconds=90):
     """Define bolinha verde/vermelha conforme último contato da máquina."""
     m = dict(machine_row)
+    public_id = _machine_public_id(m)
+    m["public_id"] = public_id
+    m["display_id"] = public_id
+    m["server_id"] = m.get("id")
     last_dt = _parse_dt_safe(m.get("last_seen"))
     if last_dt:
         seconds = max(0, int((datetime.utcnow() - last_dt).total_seconds()))
@@ -471,10 +480,9 @@ def check_pix_payment(mp_id, access_token=None):
 
 # ─── API para as Máquinas ─────────────────────────────────────────────────────
 
-@app.route("/machine/check", methods=["POST", "OPTIONS"])
-@app.route("/proxy/check", methods=["POST", "OPTIONS"])
-@app.route("/api/machine/check", methods=["POST", "OPTIONS"])
-@app.route("/api/proxy/check", methods=["POST", "OPTIONS"])
+@app.route("/machine/check", methods=["POST"])
+@app.route("/proxy/check", methods=["POST"])
+@app.route("/api/machine/check", methods=["POST"])
 def machine_check():
     """Máquina verifica licença, cadastra automaticamente e recebe conteúdo."""
     data = request.json or {}
@@ -575,7 +583,9 @@ def machine_check():
             "license_ok": license_ok,
             "license_exp": license_exp,
             "machine_name": m["name"],
-            "machine_id": m["id"],
+            "machine_id": _machine_public_id(m),
+            "server_machine_id": m["id"],
+            "hwid": m["hwid"] or "",
             "token": m["token"],
             "genres": genres,
             "pix": pix_data,
@@ -1515,7 +1525,7 @@ async function loadMachines() {
         const lastSeen = m.last_seen_label || 'Nunca conectou';
         return `
         <tr>
-            <td><strong>${m.name}</strong><br><span style="font-size:11px;color:var(--muted)">ID: ${m.id}</span></td>
+            <td><strong>${m.name}</strong><br><span style="font-size:11px;color:var(--muted)">ID: ${m.display_id || m.public_id || m.hwid || m.id}</span></td>
             <td><span class="status-dot ${onlineClass}"></span><strong>${onlineText}</strong><br><span class="muted-small">${lastSeen}</span></td>
             <td>${m.location || '-'}</td>
             <td><span class="badge ${m.license_ok ? 'green' : 'red'}">${m.license_ok ? 'Ativa' : 'Vencida'}</span></td>
@@ -1545,6 +1555,8 @@ async function testMachineConnection(id) {
     box.innerHTML = `
         <div class="card" style="margin-bottom:12px">
             <h3><span class="status-dot ${d.online ? 'green' : 'red'}"></span>${d.machine.name} — ${d.online ? 'ONLINE' : 'OFFLINE'}</h3>
+            <p><b>ID da máquina:</b> ${d.machine.display_id || d.machine.public_id || d.machine.hwid || d.machine.id}</p>
+            <p><b>ID interno servidor:</b> ${d.machine.server_id || d.machine.id}</p>
             <p><b>Último contato:</b> ${d.last_seen_label || 'Nunca conectou'}</p>
             <p><b>Rota usada pela máquina:</b> /api/machine/check ou /api/proxy/check</p>
             <p><b>IP último contato:</b> ${d.machine.last_ip || '-'}</p>
@@ -1581,7 +1593,8 @@ async function showMachineReading(id) {
         </div>
         <div class="card" style="margin-bottom:12px">
             <h3>${m.name}</h3>
-            <p><b>ID:</b> ${m.id} &nbsp; <b>Local:</b> ${m.location || '-'} &nbsp; <b>Licença:</b> ${m.license_ok ? 'Ativa' : 'Vencida'}</p>
+            <p><b>ID da máquina:</b> ${m.display_id || m.public_id || m.hwid || m.id} &nbsp; <b>ID interno servidor:</b> ${m.server_id || m.id}</p>
+            <p><b>Local:</b> ${m.location || '-'} &nbsp; <b>Licença:</b> ${m.license_ok ? 'Ativa' : 'Vencida'}</p>
             <p><b>Vence em:</b> ${m.license_exp || '-'} &nbsp; <b>Senha admin:</b> ${m.admin_pass || '1234'}</p>
             <p><b>Token:</b> <span style="font-family:monospace">${m.token}</span></p>
         </div>
@@ -2764,10 +2777,10 @@ def _import_youtube_channel_to_db(genre_id, channel_url, dvd_name_input="", arti
     }
 
 
-@app.route("/machine/genres", methods=["POST", "GET", "OPTIONS"])
-@app.route("/proxy/genres", methods=["POST", "GET", "OPTIONS"])
-@app.route("/api/proxy/genres", methods=["POST", "GET", "OPTIONS"])
-@app.route("/api/machine/genres", methods=["POST", "GET", "OPTIONS"])
+@app.route("/machine/genres", methods=["POST", "GET"])
+@app.route("/proxy/genres", methods=["POST", "GET"])
+@app.route("/api/proxy/genres", methods=["POST", "GET"])
+@app.route("/api/machine/genres", methods=["POST", "GET"])
 def machine_genres_list():
     """Lista gêneros com DVDs/músicas para app web, Android e Windows."""
     try:
