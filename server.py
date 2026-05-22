@@ -250,6 +250,20 @@ def init_db():
             amount       REAL DEFAULT 0,
             recorded_at  TEXT DEFAULT (datetime('now'))
         );
+
+        CREATE TABLE IF NOT EXISTS karaoke_scores (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            machine_id   TEXT,
+            machine_hwid TEXT,
+            machine_token TEXT,
+            player_name  TEXT NOT NULL,
+            score        INTEGER NOT NULL,
+            song_title   TEXT,
+            artist       TEXT,
+            youtube_id   TEXT,
+            genre_name   TEXT DEFAULT 'Karaokê',
+            created_at   TEXT DEFAULT (datetime('now'))
+        );
         """)
 
         # Migração: versões antigas do banco podem não ter a coluna credited.
@@ -2680,6 +2694,41 @@ def _absolute_url_for_machine(value):
     return value
 
 
+
+def _normalize_karaoke_title(value):
+    """Normaliza título para evitar duplicar a mesma música no Karaokê."""
+    txt = str(value or "").lower().strip()
+    # remove informações comuns de karaokê/canal que mudam de um vídeo para outro
+    txt = re.sub(r"\([^)]*\)", " ", txt)
+    txt = re.sub(r"\[[^\]]*\]", " ", txt)
+    txt = re.sub(r"\b(karaok[eê]|karaoke|legendado|com letra|lyrics|oficial|official|video|vídeo|clipe|audio|áudio|ao vivo|live)\b", " ", txt)
+    txt = re.sub(r"[^a-z0-9áàâãéêíóôõúçñ]+", " ", txt)
+    txt = re.sub(r"\s+", " ", txt).strip()
+    return txt
+
+
+def _is_karaoke_genre_or_mode(genre_name="", mode=""):
+    """Detecta se a importação deve aplicar regra especial do Karaokê."""
+    txt = (str(genre_name or "") + " " + str(mode or "")).lower()
+    return "karaok" in txt
+
+
+def _karaoke_title_exists(db, genre_id, normalized_title):
+    """Evita adicionar música repetida no gênero Karaokê, mesmo vindo de outro canal/DVD."""
+    if not normalized_title:
+        return False
+    rows = db.execute("""
+        SELECT p.title
+        FROM playlists p
+        LEFT JOIN genres g ON g.id = p.genre_id
+        WHERE p.genre_id=? OR LOWER(COALESCE(g.name,'')) LIKE '%karaok%' OR LOWER(COALESCE(p.mode,'')) LIKE '%karaok%'
+    """, (genre_id,)).fetchall()
+    for row in rows:
+        if _normalize_karaoke_title(row["title"]) == normalized_title:
+            return True
+    return False
+
+
 def _import_youtube_channel_to_db(genre_id, channel_url, dvd_name_input="", artist_input="", mode="jukebox", min_minutes=2, max_minutes=7, max_results=200):
     """Importa canal do YouTube para um DVD global. Usado pelo painel e pelas máquinas."""
     if not genre_id:
@@ -2749,6 +2798,12 @@ def _import_youtube_channel_to_db(genre_id, channel_url, dvd_name_input="", arti
             if not youtube_id:
                 skipped += 1
                 continue
+            karaoke_mode = _is_karaoke_genre_or_mode(genre["name"], mode)
+            normalized_title = _normalize_karaoke_title(video.get("title", ""))
+            if karaoke_mode and _karaoke_title_exists(db, genre_id, normalized_title):
+                duplicated += 1
+                continue
+
             exists = db.execute("SELECT id FROM playlists WHERE youtube_id=? AND dvd_id=? LIMIT 1", (youtube_id, dvd_id)).fetchone()
             if exists:
                 duplicated += 1
@@ -2846,66 +2901,191 @@ def machine_youtube_import_channel():
 def proxy_machine_youtube_import_channel():
     return machine_youtube_import_channel()
 
+
+# ─── Karaokê: Pontuação e Ranking ─────────────────────────────────────────────
+def _find_machine_for_karaoke(db, token="", hwid="", machine_id=""):
+    """Localiza a máquina pelo token, HWID ou ID interno/público."""
+    token = str(token or "").strip()
+    hwid = str(hwid or "").strip()
+    machine_id = str(machine_id or "").strip()
+
+    if token:
+        m = db.execute("SELECT * FROM machines WHERE token=?", (token,)).fetchone()
+        if m:
+            return m
+    if hwid:
+        m = db.execute("SELECT * FROM machines WHERE hwid=?", (hwid,)).fetchone()
+        if m:
+            return m
+    if machine_id:
+        m = db.execute("SELECT * FROM machines WHERE id=? OR hwid=?", (machine_id, machine_id)).fetchone()
+        if m:
+            return m
+    return None
+
+
+@app.route("/machine/karaoke/score", methods=["POST", "OPTIONS"])
+@app.route("/api/machine/karaoke/score", methods=["POST", "OPTIONS"])
+@app.route("/proxy/karaoke/score", methods=["POST", "OPTIONS"])
+@app.route("/api/proxy/karaoke/score", methods=["POST", "OPTIONS"])
+def machine_karaoke_score():
+    """Salva a pontuação do Karaokê e mantém ranking Top 10 por máquina."""
+    if request.method == "OPTIONS":
+        return jsonify({"ok": True})
+
+    d = request.get_json(silent=True) or {}
+    token = (d.get("token") or "").strip()
+    hwid = (d.get("hwid") or "").strip()
+    machine_id_in = (d.get("machine_id") or d.get("server_machine_id") or "").strip()
+
+    player_name = (d.get("player_name") or d.get("name") or "").strip()
+    if not player_name:
+        player_name = "JOGADOR"
+    player_name = player_name[:24]
+
+    try:
+        score = int(float(d.get("score", 1) or 1))
+    except Exception:
+        score = 1
+    score = max(1, min(99, score))
+
+    song_title = (d.get("song_title") or d.get("title") or "").strip()[:160]
+    artist = (d.get("artist") or "").strip()[:120]
+    youtube_id = (d.get("youtube_id") or "").strip()[:80]
+    genre_name = (d.get("genre_name") or "Karaokê").strip()[:80]
+
+    with get_db() as db:
+        m = _find_machine_for_karaoke(db, token=token, hwid=hwid, machine_id=machine_id_in)
+        if not m:
+            # Não quebra o app: salva sem máquina se vier sem cadastro, mas avisa.
+            machine_id = machine_id_in or ""
+            machine_hwid = hwid or ""
+            machine_token = token or ""
+        else:
+            machine_id = m["id"]
+            machine_hwid = m["hwid"] or hwid or ""
+            machine_token = m["token"] or token or ""
+            db.execute(
+                "UPDATE machines SET last_seen=datetime('now'), last_ip=?, last_user_agent=?, last_error=NULL WHERE id=?",
+                (request.headers.get('X-Forwarded-For', request.remote_addr), request.headers.get('User-Agent', ''), machine_id)
+            )
+
+        db.execute("""
+            INSERT INTO karaoke_scores
+            (machine_id, machine_hwid, machine_token, player_name, score, song_title, artist, youtube_id, genre_name)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (machine_id, machine_hwid, machine_token, player_name, score, song_title, artist, youtube_id, genre_name))
+        db.commit()
+
+        # Top 10 por máquina/HWID. Se não tiver máquina, retorna ranking global.
+        if machine_id:
+            rows = db.execute("""
+                SELECT player_name, score, song_title, artist, youtube_id, created_at
+                FROM karaoke_scores
+                WHERE machine_id=?
+                ORDER BY score DESC, datetime(created_at) ASC
+                LIMIT 10
+            """, (machine_id,)).fetchall()
+        elif machine_hwid:
+            rows = db.execute("""
+                SELECT player_name, score, song_title, artist, youtube_id, created_at
+                FROM karaoke_scores
+                WHERE machine_hwid=?
+                ORDER BY score DESC, datetime(created_at) ASC
+                LIMIT 10
+            """, (machine_hwid,)).fetchall()
+        else:
+            rows = db.execute("""
+                SELECT player_name, score, song_title, artist, youtube_id, created_at
+                FROM karaoke_scores
+                ORDER BY score DESC, datetime(created_at) ASC
+                LIMIT 10
+            """).fetchall()
+
+    ranking = [dict(r) for r in rows]
+    return jsonify({"ok": True, "saved": True, "score": score, "ranking": ranking})
+
+
+@app.route("/machine/karaoke/ranking", methods=["GET", "POST", "OPTIONS"])
+@app.route("/api/machine/karaoke/ranking", methods=["GET", "POST", "OPTIONS"])
+@app.route("/proxy/karaoke/ranking", methods=["GET", "POST", "OPTIONS"])
+@app.route("/api/proxy/karaoke/ranking", methods=["GET", "POST", "OPTIONS"])
+def machine_karaoke_ranking():
+    """Retorna Top 10 do Karaokê por máquina."""
+    if request.method == "OPTIONS":
+        return jsonify({"ok": True})
+
+    d = request.get_json(silent=True) or {}
+    token = (d.get("token") or request.args.get("token") or "").strip()
+    hwid = (d.get("hwid") or request.args.get("hwid") or "").strip()
+    machine_id_in = (d.get("machine_id") or request.args.get("machine_id") or "").strip()
+
+    with get_db() as db:
+        m = _find_machine_for_karaoke(db, token=token, hwid=hwid, machine_id=machine_id_in)
+        params = []
+        where = ""
+        if m:
+            where = "WHERE machine_id=?"
+            params = [m["id"]]
+        elif hwid:
+            where = "WHERE machine_hwid=?"
+            params = [hwid]
+
+        rows = db.execute(f"""
+            SELECT player_name, score, song_title, artist, youtube_id, created_at
+            FROM karaoke_scores
+            {where}
+            ORDER BY score DESC, datetime(created_at) ASC
+            LIMIT 10
+        """, params).fetchall()
+
+    return jsonify({"ok": True, "ranking": [dict(r) for r in rows]})
+
+
+@app.route("/admin/api/karaoke/ranking", methods=["GET"])
+def admin_karaoke_ranking():
+    """Ranking de karaokê para painel/admin ou debug."""
+    err = require_admin()
+    if err: return err
+    machine_id = (request.args.get("machine_id") or "").strip()
+    with get_db() as db:
+        if machine_id:
+            rows = db.execute("""
+                SELECT ks.*, m.name AS machine_name
+                FROM karaoke_scores ks
+                LEFT JOIN machines m ON m.id = ks.machine_id
+                WHERE ks.machine_id=? OR ks.machine_hwid=?
+                ORDER BY ks.score DESC, datetime(ks.created_at) ASC
+                LIMIT 50
+            """, (machine_id, machine_id)).fetchall()
+        else:
+            rows = db.execute("""
+                SELECT ks.*, m.name AS machine_name
+                FROM karaoke_scores ks
+                LEFT JOIN machines m ON m.id = ks.machine_id
+                ORDER BY datetime(ks.created_at) DESC
+                LIMIT 100
+            """).fetchall()
+    return jsonify({"ok": True, "ranking": [dict(r) for r in rows]})
+
+
 @app.route("/admin/api/youtube/import_channel", methods=["POST"])
 def admin_youtube_import_channel():
     err = require_admin()
     if err: return err
     d = request.json or {}
-    genre_id = d.get("genre_id") or None
-    channel_url = (d.get("channel_url") or "").strip()
-    dvd_name_input = (d.get("dvd_name") or "").strip()
-    artist_input = (d.get("artist") or "").strip()
-    mode = d.get("mode", "jukebox") or "jukebox"
-    try:
-        min_minutes = float(d.get("min_minutes", 2) or 2)
-        max_minutes = float(d.get("max_minutes", 7) or 7)
-        max_results = int(d.get("max_results", 200) or 200)
-    except Exception:
-        return jsonify({"ok": False, "error": "Limite de minutos ou quantidade inválida."})
-    # Regra fixa MajuBox: mínimo 2 e máximo 7 minutos para bloquear Shorts.
-    min_minutes = 2.0
-    max_minutes = 7.0
-    max_results = max(1, min(200, max_results))
-    if not genre_id:
-        return jsonify({"ok": False, "error": "Escolha um gênero."})
-    if not channel_url:
-        return jsonify({"ok": False, "error": "Informe o link do canal."})
-
-    try:
-        channel = resolve_youtube_channel(channel_url)
-        videos = fetch_channel_videos(channel["uploads_playlist_id"], max_results=max_results)
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)})
-
-    min_seconds = YOUTUBE_MIN_SECONDS
-    max_seconds = YOUTUBE_MAX_SECONDS
-    dvd_name = dvd_name_input or channel["title"]
-    artist = artist_input or channel["title"]
-
-    with get_db() as db:
-        next_dvd_order = db.execute("SELECT COALESCE(MAX(sort_order),0)+1 FROM dvds WHERE genre_id=?", (genre_id,)).fetchone()[0] or 1
-        cur = db.execute(
-            "INSERT INTO dvds(genre_id,name,cover_url,sort_order) VALUES(?,?,?,?)",
-            (genre_id, dvd_name, channel.get("cover_url", ""), next_dvd_order)
-        )
-        dvd_id = cur.lastrowid
-        base_order = db.execute("SELECT COALESCE(MAX(sort_order),0) FROM playlists WHERE genre_id=? AND COALESCE(dvd_id,0)=COALESCE(?,0)", (genre_id, dvd_id)).fetchone()[0] or 0
-        inserted = 0
-        skipped = 0
-        for video in videos:
-            dur = int(video.get("duration_seconds", 0) or 0)
-            # Bloqueia Shorts e vídeos fora do intervalo 2–7 minutos.
-            if _is_probable_short_video(video):
-                skipped += 1
-                continue
-            inserted += 1
-            db.execute(
-                "INSERT INTO playlists(genre_id,dvd_id,title,artist,youtube_id,video_url,cover_url,mode,sort_order) VALUES(?,?,?,?,?,?,?,?,?)",
-                (genre_id, dvd_id, video["title"], artist, video["youtube_id"], f"https://www.youtube.com/watch?v={video['youtube_id']}", video.get("cover_url", ""), mode, base_order + inserted)
-            )
-        db.commit()
-
-    return jsonify({"ok": True, "dvd_id": dvd_id, "dvd_name": dvd_name, "inserted": inserted, "skipped": skipped, "channel_title": channel["title"]})
+    result = _import_youtube_channel_to_db(
+        genre_id=d.get("genre_id") or None,
+        channel_url=(d.get("channel_url") or "").strip(),
+        dvd_name_input=(d.get("dvd_name") or "").strip(),
+        artist_input=(d.get("artist") or "").strip(),
+        mode=d.get("mode", "jukebox") or "jukebox",
+        min_minutes=d.get("min_minutes", 2),
+        max_minutes=d.get("max_minutes", 7),
+        max_results=d.get("max_results", 200),
+    )
+    status = 200 if result.get("ok") else 400
+    return jsonify(result), status
 
 
 @app.route("/admin/api/playlists/<int:pid>", methods=["DELETE", "PUT"])
