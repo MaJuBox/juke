@@ -155,183 +155,329 @@ ML_ACCESS_TOKEN = os.environ.get("ML_ACCESS_TOKEN", "")
 ML_CLIENT_ID = os.environ.get("ML_CLIENT_ID", "")
 ML_CLIENT_SECRET = os.environ.get("ML_CLIENT_SECRET", "")
 
-# ─── Banco de dados ───────────────────────────────────────────────────────────
+# ─── Banco de dados: SQLite local OU Supabase/Postgres ────────────────────────
+# Como funciona:
+# - Sem DATABASE_URL: continua usando o arquivo local majubox.db (SQLite).
+# - Com DATABASE_URL/SUPABASE_DB_URL/POSTGRES_URL: usa Supabase Postgres.
+# Assim você pode atualizar o servidor sem perder os dados, porque os dados ficam
+# no Supabase e não mais dentro do arquivo do projeto.
+DATABASE_URL = (
+    os.environ.get("DATABASE_URL")
+    or os.environ.get("SUPABASE_DB_URL")
+    or os.environ.get("POSTGRES_URL")
+    or ""
+).strip()
+USE_POSTGRES = DATABASE_URL.startswith(("postgres://", "postgresql://"))
+
+try:
+    import psycopg
+except Exception:
+    psycopg = None
+
+class CompatRow:
+    """Linha compatível com sqlite3.Row: aceita row['campo'] e row[0]."""
+    def __init__(self, columns, values):
+        self._columns = list(columns or [])
+        self._values = tuple(values or [])
+        self._map = {c: self._values[i] for i, c in enumerate(self._columns)}
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            return self._values[key]
+        return self._map[key]
+    def get(self, key, default=None):
+        return self._map.get(key, default)
+    def keys(self):
+        return self._map.keys()
+    def items(self):
+        return self._map.items()
+    def __iter__(self):
+        return iter(self._values)
+    def __len__(self):
+        return len(self._values)
+
+class PgCursorCompat:
+    def __init__(self, cursor):
+        self.cursor = cursor
+        self.lastrowid = None
+        self._columns = []
+    def execute(self, sql, params=None):
+        sql = _pg_sql(sql)
+        # Se o código pedir lastrowid em INSERT de tabela serial, adiciona RETURNING id.
+        if sql.strip().lower().startswith(("insert into dvds", "insert into genres", "insert into playlists")) and " returning " not in sql.lower():
+            sql += " RETURNING id"
+        self.cursor.execute(sql, params or ())
+        self._columns = [d.name for d in (self.cursor.description or [])]
+        self.lastrowid = None
+        if self._columns == ["id"]:
+            row = self.cursor.fetchone()
+            if row:
+                self.lastrowid = row[0]
+        return self
+    def fetchone(self):
+        row = self.cursor.fetchone()
+        if row is None:
+            return None
+        return CompatRow(self._columns, row)
+    def fetchall(self):
+        return [CompatRow(self._columns, r) for r in self.cursor.fetchall()]
+    def __iter__(self):
+        for r in self.fetchall():
+            yield r
+
+class PgConnCompat:
+    def __init__(self):
+        if psycopg is None:
+            raise RuntimeError("psycopg não instalado. Rode: pip install -r requirements.txt")
+        self.conn = psycopg.connect(DATABASE_URL, autocommit=False)
+    def execute(self, sql, params=None):
+        return PgCursorCompat(self.conn.cursor()).execute(sql, params)
+    def executescript(self, script):
+        # Usado só no SQLite; deixado aqui para evitar erro se chamar por engano.
+        for part in script.split(';'):
+            if part.strip():
+                self.execute(part)
+    def commit(self):
+        self.conn.commit()
+    def rollback(self):
+        self.conn.rollback()
+    def close(self):
+        self.conn.close()
+    def __enter__(self):
+        return self
+    def __exit__(self, exc_type, exc, tb):
+        if exc_type:
+            self.rollback()
+        else:
+            self.commit()
+        self.close()
+
+
+def _pg_sql(sql):
+    """Converte o SQL simples do SQLite para Postgres/Supabase."""
+    s = sql
+    s = s.replace("?", "%s")
+    s = s.replace("datetime('now')", "NOW()")
+    s = s.replace("date('now')", "CURRENT_DATE")
+    s = s.replace("date(played_at)", "DATE(played_at)")
+    s = s.replace("strftime('%Y-%m', recorded_at)", "TO_CHAR(recorded_at, 'YYYY-MM')")
+    s = s.replace("datetime(ks.created_at)", "ks.created_at")
+    s = s.replace("datetime(created_at)", "created_at")
+    return s
+
+
 def get_db():
+    if USE_POSTGRES:
+        return PgConnCompat()
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
 
+POSTGRES_SCHEMA = """
+CREATE TABLE IF NOT EXISTS machines (
+    id          TEXT PRIMARY KEY,
+    name        TEXT NOT NULL,
+    location    TEXT,
+    token       TEXT UNIQUE NOT NULL,
+    hwid        TEXT UNIQUE,
+    active      INTEGER DEFAULT 1,
+    license_ok  INTEGER DEFAULT 1,
+    license_exp TEXT,
+    admin_pass  TEXT DEFAULT '1234',
+    pix_key     TEXT,
+    pix_name    TEXT,
+    pix_city    TEXT,
+    mp_token    TEXT,
+    last_seen   TIMESTAMP,
+    last_ip     TEXT,
+    last_user_agent TEXT,
+    last_error  TEXT,
+    app_version TEXT,
+    created_at  TIMESTAMP DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS genres (
+    id          BIGSERIAL PRIMARY KEY,
+    name        TEXT NOT NULL,
+    cover_url   TEXT,
+    sort_order  INTEGER DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS dvds (
+    id          BIGSERIAL PRIMARY KEY,
+    genre_id    BIGINT REFERENCES genres(id) ON DELETE CASCADE,
+    name        TEXT NOT NULL,
+    cover_url   TEXT,
+    sort_order  INTEGER DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS playlists (
+    id           BIGSERIAL PRIMARY KEY,
+    genre_id     BIGINT REFERENCES genres(id) ON DELETE CASCADE,
+    dvd_id       BIGINT REFERENCES dvds(id) ON DELETE SET NULL,
+    title        TEXT NOT NULL,
+    artist       TEXT,
+    youtube_id   TEXT NOT NULL,
+    video_url    TEXT,
+    cover_url    TEXT,
+    mode         TEXT DEFAULT 'jukebox',
+    sort_order   INTEGER DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS payments (
+    id           TEXT PRIMARY KEY,
+    machine_id   TEXT REFERENCES machines(id),
+    amount       REAL DEFAULT 0,
+    credits      INTEGER DEFAULT 0,
+    status       TEXT DEFAULT 'pending',
+    pix_qr       TEXT,
+    pix_code     TEXT,
+    mp_id        TEXT,
+    payment_type TEXT DEFAULT 'license',
+    credited     INTEGER DEFAULT 0,
+    created_at   TIMESTAMP DEFAULT NOW(),
+    paid_at      TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS plays (
+    id           BIGSERIAL PRIMARY KEY,
+    machine_id   TEXT,
+    playlist_id  BIGINT,
+    played_at    TIMESTAMP DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS license_revenue (
+    id           BIGSERIAL PRIMARY KEY,
+    machine_id   TEXT REFERENCES machines(id),
+    month        TEXT NOT NULL,
+    total        REAL DEFAULT 0,
+    created_at   TIMESTAMP DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS machine_revenue_log (
+    id           BIGSERIAL PRIMARY KEY,
+    machine_id   TEXT REFERENCES machines(id),
+    amount       REAL DEFAULT 0,
+    recorded_at  TIMESTAMP DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS karaoke_scores (
+    id           BIGSERIAL PRIMARY KEY,
+    machine_id   TEXT,
+    machine_hwid TEXT,
+    machine_token TEXT,
+    player_name  TEXT NOT NULL,
+    score        INTEGER NOT NULL,
+    song_title   TEXT,
+    artist       TEXT,
+    youtube_id   TEXT,
+    genre_name   TEXT DEFAULT 'Karaokê',
+    created_at   TIMESTAMP DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_machines_token ON machines(token);
+CREATE INDEX IF NOT EXISTS idx_machines_hwid ON machines(hwid);
+CREATE INDEX IF NOT EXISTS idx_playlists_genre_dvd ON playlists(genre_id, dvd_id);
+CREATE INDEX IF NOT EXISTS idx_payments_machine_status ON payments(machine_id, status);
+CREATE INDEX IF NOT EXISTS idx_karaoke_scores_score ON karaoke_scores(score DESC);
+"""
+
+SQLITE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS machines (
+    id          TEXT PRIMARY KEY,
+    name        TEXT NOT NULL,
+    location    TEXT,
+    token       TEXT UNIQUE NOT NULL,
+    hwid        TEXT UNIQUE,
+    active      INTEGER DEFAULT 1,
+    license_ok  INTEGER DEFAULT 1,
+    license_exp TEXT,
+    admin_pass  TEXT DEFAULT '1234',
+    pix_key     TEXT,
+    pix_name    TEXT,
+    pix_city    TEXT,
+    mp_token    TEXT,
+    last_seen   TEXT,
+    last_ip     TEXT,
+    last_user_agent TEXT,
+    last_error  TEXT,
+    app_version TEXT,
+    created_at  TEXT DEFAULT (datetime('now'))
+);
+CREATE TABLE IF NOT EXISTS genres (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, cover_url TEXT, sort_order INTEGER DEFAULT 0);
+CREATE TABLE IF NOT EXISTS dvds (id INTEGER PRIMARY KEY AUTOINCREMENT, genre_id INTEGER REFERENCES genres(id) ON DELETE CASCADE, name TEXT NOT NULL, cover_url TEXT, sort_order INTEGER DEFAULT 0);
+CREATE TABLE IF NOT EXISTS playlists (id INTEGER PRIMARY KEY AUTOINCREMENT, genre_id INTEGER REFERENCES genres(id) ON DELETE CASCADE, dvd_id INTEGER REFERENCES dvds(id) ON DELETE SET NULL, title TEXT NOT NULL, artist TEXT, youtube_id TEXT NOT NULL, video_url TEXT, cover_url TEXT, mode TEXT DEFAULT 'jukebox', sort_order INTEGER DEFAULT 0);
+CREATE TABLE IF NOT EXISTS payments (id TEXT PRIMARY KEY, machine_id TEXT REFERENCES machines(id), amount REAL DEFAULT 0, credits INTEGER DEFAULT 0, status TEXT DEFAULT 'pending', pix_qr TEXT, pix_code TEXT, mp_id TEXT, payment_type TEXT DEFAULT 'license', credited INTEGER DEFAULT 0, created_at TEXT DEFAULT (datetime('now')), paid_at TEXT);
+CREATE TABLE IF NOT EXISTS plays (id INTEGER PRIMARY KEY AUTOINCREMENT, machine_id TEXT, playlist_id INTEGER, played_at TEXT DEFAULT (datetime('now')));
+CREATE TABLE IF NOT EXISTS license_revenue (id INTEGER PRIMARY KEY AUTOINCREMENT, machine_id TEXT REFERENCES machines(id), month TEXT NOT NULL, total REAL DEFAULT 0, created_at TEXT DEFAULT (datetime('now')));
+CREATE TABLE IF NOT EXISTS machine_revenue_log (id INTEGER PRIMARY KEY AUTOINCREMENT, machine_id TEXT REFERENCES machines(id), amount REAL DEFAULT 0, recorded_at TEXT DEFAULT (datetime('now')));
+CREATE TABLE IF NOT EXISTS karaoke_scores (id INTEGER PRIMARY KEY AUTOINCREMENT, machine_id TEXT, machine_hwid TEXT, machine_token TEXT, player_name TEXT NOT NULL, score INTEGER NOT NULL, song_title TEXT, artist TEXT, youtube_id TEXT, genre_name TEXT DEFAULT 'Karaokê', created_at TEXT DEFAULT (datetime('now')));
+"""
+
+
+def _ensure_column(db, table, column, definition):
+    """Adiciona coluna se faltar, tanto no SQLite quanto no Supabase/Postgres."""
+    try:
+        if USE_POSTGRES:
+            exists = db.execute(
+                "SELECT column_name FROM information_schema.columns WHERE table_name=%s AND column_name=%s",
+                (table, column)
+            ).fetchone()
+            if not exists:
+                db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+        else:
+            cols = [r[1] for r in db.execute(f"PRAGMA table_info({table})").fetchall()]
+            if column not in cols:
+                db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+    except Exception as e:
+        print(f"[DB MIGRATION] Coluna {table}.{column}: {e}")
+
+
 def init_db():
     with get_db() as db:
-        db.executescript("""
-        CREATE TABLE IF NOT EXISTS machines (
-            id          TEXT PRIMARY KEY,
-            name        TEXT NOT NULL,
-            location    TEXT,
-            token       TEXT UNIQUE NOT NULL,
-            hwid        TEXT UNIQUE,
-            active      INTEGER DEFAULT 1,
-            license_ok  INTEGER DEFAULT 1,
-            license_exp TEXT,
-            admin_pass  TEXT DEFAULT '1234',
-            pix_key     TEXT,
-            pix_name    TEXT,
-            pix_city    TEXT,
-            mp_token    TEXT,
-            last_seen   TEXT,
-            last_ip     TEXT,
-            last_user_agent TEXT,
-            last_error  TEXT,
-            app_version TEXT,
-            created_at  TEXT DEFAULT (datetime('now'))
-        );
+        db.executescript(POSTGRES_SCHEMA if USE_POSTGRES else SQLITE_SCHEMA)
 
-        CREATE TABLE IF NOT EXISTS genres (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            name        TEXT NOT NULL,
-            cover_url   TEXT,
-            sort_order  INTEGER DEFAULT 0
-        );
-
-        CREATE TABLE IF NOT EXISTS dvds (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            genre_id    INTEGER REFERENCES genres(id) ON DELETE CASCADE,
-            name        TEXT NOT NULL,
-            cover_url   TEXT,
-            sort_order  INTEGER DEFAULT 0
-        );
-
-        CREATE TABLE IF NOT EXISTS playlists (
-            id           INTEGER PRIMARY KEY AUTOINCREMENT,
-            genre_id     INTEGER REFERENCES genres(id) ON DELETE CASCADE,
-            dvd_id       INTEGER REFERENCES dvds(id) ON DELETE SET NULL,
-            title        TEXT NOT NULL,
-            artist       TEXT,
-            youtube_id   TEXT NOT NULL,
-            video_url    TEXT,
-            cover_url    TEXT,
-            mode         TEXT DEFAULT 'jukebox',
-            sort_order   INTEGER DEFAULT 0
-        );
-
-        CREATE TABLE IF NOT EXISTS payments (
-            id           TEXT PRIMARY KEY,
-            machine_id   TEXT REFERENCES machines(id),
-            amount       REAL DEFAULT 0,
-            credits      INTEGER DEFAULT 0,
-            status       TEXT DEFAULT 'pending',
-            pix_qr       TEXT,
-            pix_code     TEXT,
-            mp_id        TEXT,
-            payment_type TEXT DEFAULT 'license',
-            credited     INTEGER DEFAULT 0,
-            created_at   TEXT DEFAULT (datetime('now')),
-            paid_at      TEXT
-        );
-
-        CREATE TABLE IF NOT EXISTS plays (
-            id           INTEGER PRIMARY KEY AUTOINCREMENT,
-            machine_id   TEXT,
-            playlist_id  INTEGER,
-            played_at    TEXT DEFAULT (datetime('now'))
-        );
-
-        CREATE TABLE IF NOT EXISTS license_revenue (
-            id           INTEGER PRIMARY KEY AUTOINCREMENT,
-            machine_id   TEXT REFERENCES machines(id),
-            month        TEXT NOT NULL,
-            total        REAL DEFAULT 0,
-            created_at   TEXT DEFAULT (datetime('now'))
-        );
-
-        CREATE TABLE IF NOT EXISTS machine_revenue_log (
-            id           INTEGER PRIMARY KEY AUTOINCREMENT,
-            machine_id   TEXT REFERENCES machines(id),
-            amount       REAL DEFAULT 0,
-            recorded_at  TEXT DEFAULT (datetime('now'))
-        );
-
-        CREATE TABLE IF NOT EXISTS karaoke_scores (
-            id           INTEGER PRIMARY KEY AUTOINCREMENT,
-            machine_id   TEXT,
-            machine_hwid TEXT,
-            machine_token TEXT,
-            player_name  TEXT NOT NULL,
-            score        INTEGER NOT NULL,
-            song_title   TEXT,
-            artist       TEXT,
-            youtube_id   TEXT,
-            genre_name   TEXT DEFAULT 'Karaokê',
-            created_at   TEXT DEFAULT (datetime('now'))
-        );
-        """)
-
-        # Migração: versões antigas do banco podem não ter a coluna credited.
-        cols = [r[1] for r in db.execute("PRAGMA table_info(payments)").fetchall()]
-        if "credited" not in cols:
-            db.execute("ALTER TABLE payments ADD COLUMN credited INTEGER DEFAULT 0")
-
-        # Migrações seguras para bancos antigos
-        for sql in [
-            "ALTER TABLE machines ADD COLUMN hwid TEXT",
-            "ALTER TABLE machines ADD COLUMN mp_token TEXT",
-            "ALTER TABLE machines ADD COLUMN last_seen TEXT",
-            "ALTER TABLE machines ADD COLUMN last_ip TEXT",
-            "ALTER TABLE machines ADD COLUMN last_user_agent TEXT",
-            "ALTER TABLE machines ADD COLUMN last_error TEXT",
-            "ALTER TABLE machines ADD COLUMN app_version TEXT",
-            "ALTER TABLE payments ADD COLUMN credited INTEGER DEFAULT 0",
-            "ALTER TABLE payments ADD COLUMN payment_type TEXT DEFAULT 'license'",
-            "ALTER TABLE payments ADD COLUMN pix_qr TEXT",
-            "ALTER TABLE payments ADD COLUMN pix_code TEXT",
-            "ALTER TABLE payments ADD COLUMN mp_id TEXT",
-            "ALTER TABLE payments ADD COLUMN paid_at TEXT",
+        # Migrações seguras para banco antigo.
+        for table, column, definition in [
+            ("machines", "hwid", "TEXT"),
+            ("machines", "mp_token", "TEXT"),
+            ("machines", "last_seen", "TIMESTAMP" if USE_POSTGRES else "TEXT"),
+            ("machines", "last_ip", "TEXT"),
+            ("machines", "last_user_agent", "TEXT"),
+            ("machines", "last_error", "TEXT"),
+            ("machines", "app_version", "TEXT"),
+            ("payments", "credited", "INTEGER DEFAULT 0"),
+            ("payments", "payment_type", "TEXT DEFAULT 'license'"),
+            ("payments", "pix_qr", "TEXT"),
+            ("payments", "pix_code", "TEXT"),
+            ("payments", "mp_id", "TEXT"),
+            ("payments", "paid_at", "TIMESTAMP" if USE_POSTGRES else "TEXT"),
         ]:
-            try:
-                db.execute(sql)
-            except Exception:
-                pass
+            _ensure_column(db, table, column, definition)
 
-        # Gêneros padrão
+        # Gêneros padrão: só insere se o banco estiver vazio.
         count = db.execute("SELECT COUNT(*) FROM genres").fetchone()[0]
         if count == 0:
             default_genres = [
-                ("Sertanejo", "", 0),
-                ("Pagode", "", 1),
-                ("Forró", "", 2),
-                ("Axé", "", 3),
-                ("Funk", "", 4),
-                ("Rock", "", 5),
-                ("Karaokê", "", 6),
-                ("MPB", "", 7),
-                ("Samba", "", 8),
-                ("Pop", "", 9),
-                ("Eletrônica", "", 10),
-                ("Gospel", "", 11),
+                ("Sertanejo", "", 0), ("Pagode", "", 1), ("Forró", "", 2),
+                ("Axé", "", 3), ("Funk", "", 4), ("Rock", "", 5),
+                ("Karaokê", "", 6), ("MPB", "", 7), ("Samba", "", 8),
+                ("Pop", "", 9), ("Eletrônica", "", 10), ("Gospel", "", 11),
             ]
             for name, cover, order in default_genres:
-                db.execute("INSERT INTO genres(name,cover_url,sort_order) VALUES(?,?,?)",
-                           (name, cover, order))
+                db.execute("INSERT INTO genres(name,cover_url,sort_order) VALUES(?,?,?)", (name, cover, order))
 
-        # Garante que todos os gêneros padrão existam, mesmo em banco antigo.
         existing_names = {str(r[0]).lower(): r[0] for r in db.execute("SELECT name FROM genres").fetchall()}
         current_max_order = db.execute("SELECT COALESCE(MAX(sort_order), 0) FROM genres").fetchone()[0] or 0
         for genre_name in DEFAULT_GENRE_COVERS.keys():
             if genre_name.lower() not in existing_names:
                 current_max_order += 1
-                db.execute(
-                    "INSERT INTO genres(name,cover_url,sort_order) VALUES(?,?,?)",
-                    (genre_name, DEFAULT_GENRE_COVERS.get(genre_name, ""), current_max_order)
-                )
+                db.execute("INSERT INTO genres(name,cover_url,sort_order) VALUES(?,?,?)", (genre_name, DEFAULT_GENRE_COVERS.get(genre_name, ""), current_max_order))
 
-        # Atualiza capas padrão dos gêneros, sem apagar capas que você já configurou.
         for genre_name, cover_path in DEFAULT_GENRE_COVERS.items():
-            db.execute(
-                "UPDATE genres SET cover_url=? WHERE name=? AND (cover_url IS NULL OR cover_url='')",
-                (cover_path, genre_name)
-            )
+            db.execute("UPDATE genres SET cover_url=? WHERE name=? AND (cover_url IS NULL OR cover_url='')", (cover_path, genre_name))
 
         db.commit()
+
 
 init_db()
 

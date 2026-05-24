@@ -1,0 +1,62 @@
+COMO CRIAR O BANCO NO SUPABASE PARA O MAJUBOX
+
+1) Criar o projeto
+- Entre no Supabase.
+- Clique em New project.
+- Escolha nome, senha do banco e região. Para Brasil, se aparecer South America / São Paulo, prefira essa.
+- Guarde a senha do banco. Você vai precisar dela na conexão.
+
+2) Criar as tabelas
+Opção mais fácil:
+- Abra o projeto no Supabase.
+- Vá em SQL Editor.
+- Clique em New query.
+- Abra o arquivo supabase_schema.sql deste pacote.
+- Copie tudo, cole no SQL Editor e clique em Run.
+
+Observação: o servidor também cria as tabelas sozinho na primeira inicialização quando DATABASE_URL estiver configurado, mas rodar o SQL antes facilita ver se está tudo certo.
+
+3) Pegar a connection string
+- No projeto Supabase, clique em Connect.
+- Use a conexão Session pooler, porta 5432.
+- Copie a URI/connection string.
+- Troque [YOUR-PASSWORD] pela senha do banco.
+
+Exemplo do formato:
+postgresql://postgres.SEUPROJECTREF:SUA_SENHA@aws-0-sa-east-1.pooler.supabase.com:5432/postgres
+
+4) Configurar no Render
+No Render, abra o serviço do servidor MajuBox:
+- Environment
+- Add Environment Variable
+
+Coloque:
+DATABASE_URL = sua connection string do Supabase
+ADMIN_PASSWORD = sua senha do painel
+MAJUBOX_SECRET = uma chave grande qualquer
+MP_ACCESS_TOKEN = token do Mercado Pago, se usar PIX de licença
+YOUTUBE_API_KEY = sua chave do YouTube, se usar importação YouTube
+
+Depois clique em Manual Deploy / Deploy latest commit.
+
+5) Migrar dados antigos do arquivo majubox.db, se você já tem dados
+No seu computador ou no servidor, com este pacote:
+- pip install -r requirements.txt
+- configure DATABASE_URL
+- rode: python migrar_sqlite_para_supabase.py
+
+Esse script não apaga dados do Supabase. Ele copia/atualiza máquinas, gêneros, DVDs, playlists, pagamentos, leituras, pontuação e faturamento.
+
+6) Como atualizar sem perder dados
+Depois que estiver usando Supabase:
+- Pode atualizar o código do servidor normalmente.
+- Não substitua nem apague o projeto do Supabase.
+- Mantenha a mesma DATABASE_URL no Render.
+- Os dados ficam no Supabase, não dentro do ZIP/projeto.
+
+7) Teste rápido
+Depois do deploy, abra:
+https://SEU-SERVIDOR.onrender.com/api/health
+
+Tem que responder algo parecido com:
+{"ok": true, "status": "online", "service": "MajuBox"}
