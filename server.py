@@ -3401,6 +3401,141 @@ def index():
     return redirect("/admin")
 
 
+
+# ─── API externa para app buscador de canais ───────────────────────────────────
+def _external_admin_ok(data=None):
+    """Autoriza app externo sem sessão do navegador.
+    Use a senha admin em X-MajuBox-Admin-Password ou no JSON como admin_password.
+    """
+    data = data or {}
+    password = (
+        request.headers.get("X-MajuBox-Admin-Password")
+        or request.args.get("admin_password")
+        or data.get("admin_password")
+        or ""
+    )
+    return str(password) == str(ADMIN_PASSWORD)
+
+
+@app.route("/api/external/genres", methods=["GET", "POST", "OPTIONS"])
+def external_genres():
+    """Lista gêneros para o app externo escolher onde salvar os DVDs."""
+    if request.method == "OPTIONS":
+        return jsonify({"ok": True})
+    data = request.get_json(silent=True) or {}
+    if not _external_admin_ok(data):
+        return jsonify({"ok": False, "error": "Senha admin inválida para comunicação externa."}), 403
+    with get_db() as db:
+        genres = [dict(g) for g in db.execute("SELECT id,name,cover_url,sort_order FROM genres ORDER BY sort_order,name").fetchall()]
+    return jsonify({"ok": True, "genres": genres})
+
+
+@app.route("/api/external/youtube/import_channel", methods=["POST", "OPTIONS"])
+def external_youtube_import_channel():
+    """Recebe 1 canal do app buscador e salva como DVD no banco base."""
+    if request.method == "OPTIONS":
+        return jsonify({"ok": True})
+    d = request.get_json(silent=True) or {}
+    if not _external_admin_ok(d):
+        return jsonify({"ok": False, "error": "Senha admin inválida para comunicação externa."}), 403
+
+    result = _import_youtube_channel_to_db(
+        genre_id=d.get("genre_id"),
+        channel_url=(d.get("channel_url") or d.get("channel_id") or d.get("handle") or "").strip(),
+        dvd_name_input=(d.get("dvd_name") or d.get("name") or d.get("nome") or "").strip(),
+        artist_input=(d.get("artist") or d.get("nome") or d.get("name") or "").strip(),
+        mode=d.get("mode", "jukebox") or "jukebox",
+        min_minutes=2,
+        max_minutes=7,
+        max_results=d.get("max_results", 200),
+    )
+    status = 200 if result.get("ok") else 400
+    return jsonify(result), status
+
+
+@app.route("/api/external/youtube/import_channels", methods=["POST", "OPTIONS"])
+def external_youtube_import_channels():
+    """Recebe vários canais do app buscador.
+    Cada canal vira DVD no gênero escolhido e os vídeos entram em playlists.
+    """
+    if request.method == "OPTIONS":
+        return jsonify({"ok": True})
+    d = request.get_json(silent=True) or {}
+    if not _external_admin_ok(d):
+        return jsonify({"ok": False, "error": "Senha admin inválida para comunicação externa."}), 403
+
+    genre_id = d.get("genre_id")
+    mode = d.get("mode", "jukebox") or "jukebox"
+    try:
+        max_results = int(d.get("max_results") or 200)
+    except Exception:
+        max_results = 200
+    max_results = max(1, min(200, max_results))
+
+    channels = d.get("channels") or []
+    if not genre_id:
+        return jsonify({"ok": False, "error": "Escolha um gênero."}), 400
+    if not isinstance(channels, list) or not channels:
+        return jsonify({"ok": False, "error": "Nenhum canal recebido."}), 400
+
+    results = []
+    imported = 0
+    failed = 0
+    seen = set()
+
+    for ch in channels:
+        if not isinstance(ch, dict):
+            continue
+
+        name = (
+            ch.get("nome") or ch.get("name") or ch.get("title") or
+            ch.get("channelTitle") or ch.get("handle") or ch.get("channel_id") or "Canal"
+        )
+        channel_url = (
+            ch.get("channel_url") or ch.get("link_handle") or ch.get("url") or ch.get("link") or
+            ch.get("link_canal") or ch.get("handle") or ch.get("channel_id") or ch.get("channelId") or ""
+        )
+
+        channel_url = str(channel_url or "").strip()
+        if channel_url.startswith("UC"):
+            channel_url = "https://www.youtube.com/channel/" + channel_url
+        elif channel_url.startswith("@"):
+            channel_url = "https://www.youtube.com/" + channel_url
+
+        key = channel_url.lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+
+        result = _import_youtube_channel_to_db(
+            genre_id=genre_id,
+            channel_url=channel_url,
+            dvd_name_input=str(name),
+            artist_input=str(name),
+            mode=mode,
+            min_minutes=2,
+            max_minutes=7,
+            max_results=max_results,
+        )
+
+        result["source_channel"] = channel_url
+        result["source_name"] = str(name)
+        if result.get("ok"):
+            imported += 1
+        else:
+            failed += 1
+        results.append(result)
+
+    return jsonify({
+        "ok": True,
+        "total_received": len(channels),
+        "processed": len(seen),
+        "imported": imported,
+        "failed": failed,
+        "results": results
+    })
+
+
 if __name__ == "__main__":
     print("=" * 55)
     print("  🎵 MajuBox — Servidor Central")
