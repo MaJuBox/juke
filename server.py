@@ -1353,7 +1353,6 @@ th { color: var(--muted); font-weight: 600; }
         <button class="btn" onclick="openModal('modal-playlist')">+ Adicionar Música</button>
         <button class="btn btn-ghost" onclick="openModal('modal-bulk-playlist')">📋 Adicionar lista do DVD</button>
         <button class="btn btn-ghost" onclick="openModal('modal-youtube-channel')">📺 Importar canal YouTube</button>
-        <button class="btn btn-ghost" onclick="openModal('modal-youtube-json')">📦 Importar JSON de canais</button>
     </div>
     <div id="playlists-list"></div>
 </div>
@@ -1604,36 +1603,6 @@ th { color: var(--muted); font-weight: 600; }
 </div>
 
 
-
-<div class="modal" id="modal-youtube-json">
-    <div class="modal-box" style="width:760px">
-        <h2>📦 Importar JSON de canais como DVDs</h2>
-        <p style="color:var(--muted);font-size:13px;margin-bottom:12px">
-            Cole aqui o JSON gerado pelo app buscador de canais. Cada canal vira um DVD dentro do gênero escolhido.
-            O servidor importa os vídeos reais de cada canal e mantém o sistema sem dados falsos.
-        </p>
-        <label>Gênero onde os DVDs serão criados</label>
-        <select id="yj-genre"></select>
-        <label>Modo das músicas</label>
-        <select id="yj-mode">
-            <option value="jukebox">Jukebox</option>
-            <option value="karaoke">Karaokê</option>
-        </select>
-        <label>Quantidade máxima de vídeos por canal</label>
-        <input id="yj-max-results" type="number" min="1" max="200" value="50">
-        <label>JSON dos canais</label>
-        <textarea id="yj-json" rows="14" placeholder='Cole aqui o JSON exportado pelo app. Exemplo:
-[
-  {"nome":"Canal Exemplo","handle":"@canal","link_canal":"https://www.youtube.com/channel/UC..."}
-]'></textarea>
-        <div id="yj-result" style="color:var(--muted);font-size:13px;margin-top:10px;white-space:pre-wrap"></div>
-        <div class="row" style="margin-top:20px;justify-content:flex-end">
-            <button class="btn btn-ghost" onclick="closeModal('modal-youtube-json')">Cancelar</button>
-            <button class="btn" onclick="importYouTubeChannelsJson()">Importar JSON</button>
-        </div>
-    </div>
-</div>
-
 <div class="modal" id="modal-machine-reading">
     <div class="modal-box" style="width:760px">
         <h2>📖 Leitura da Máquina</h2>
@@ -1680,7 +1649,7 @@ function showTab(t) {
 
 function openModal(id) {
     // Garante que os selects de gênero/DVD estejam carregados antes de abrir modais
-    if (id === 'modal-youtube-channel' || id === 'modal-youtube-json' || id === 'modal-bulk-playlist' || id === 'modal-playlist' || id === 'modal-dvd') {
+    if (id === 'modal-youtube-channel' || id === 'modal-bulk-playlist' || id === 'modal-playlist' || id === 'modal-dvd') {
         loadGenres();
         loadDVDs();
     }
@@ -1839,7 +1808,6 @@ async function loadGenres() {
     const dvdFlt = document.getElementById('dvd-genre-filter');
     const bulkSel = document.getElementById('b-genre');
     const ycSel = document.getElementById('yc-genre');
-    const yjSel = document.getElementById('yj-genre');
 
     sel.innerHTML = '<option value="">Selecione</option>';
     dvdSel.innerHTML = '<option value="">Selecione</option>';
@@ -1847,7 +1815,6 @@ async function loadGenres() {
     dvdFlt.innerHTML = '<option value="">Todos os gêneros</option>';
     if (bulkSel) bulkSel.innerHTML = '<option value="">Selecione</option>';
     if (ycSel) ycSel.innerHTML = '<option value="">Selecione</option>';
-    if (yjSel) yjSel.innerHTML = '<option value="">Selecione</option>';
 
     document.getElementById('genres-grid').innerHTML = d.genres.map(g => `
         <div class="card genre-card">
@@ -1868,7 +1835,6 @@ async function loadGenres() {
         dvdFlt.innerHTML += `<option value="${g.id}">${g.name}</option>`;
         if (bulkSel) bulkSel.innerHTML += `<option value="${g.id}">${g.name}</option>`;
         if (ycSel) ycSel.innerHTML += `<option value="${g.id}">${g.name}</option>`;
-        if (yjSel) yjSel.innerHTML += `<option value="${g.id}">${g.name}</option>`;
     });
 }
 
@@ -2068,65 +2034,6 @@ async function importYouTubeChannel() {
         btns.forEach(b => b.disabled = false);
     }
 }
-
-
-async function importYouTubeChannelsJson() {
-    const resultBox = document.getElementById('yj-result');
-    const btns = document.querySelectorAll('#modal-youtube-json button');
-    const genreId = document.getElementById('yj-genre').value;
-    const mode = document.getElementById('yj-mode').value || 'jukebox';
-    const maxResults = document.getElementById('yj-max-results').value || '50';
-    const raw = document.getElementById('yj-json').value.trim();
-
-    if (!genreId) {
-        resultBox.style.color = '#e74c3c';
-        resultBox.textContent = 'Escolha um gênero antes de importar.';
-        return;
-    }
-    if (!raw) {
-        resultBox.style.color = '#e74c3c';
-        resultBox.textContent = 'Cole o JSON gerado pelo app buscador de canais.';
-        return;
-    }
-
-    resultBox.style.color = 'var(--yellow)';
-    resultBox.textContent = 'Importando JSON... pode demorar, porque cada canal vira um DVD e os vídeos são puxados da API.';
-    btns.forEach(b => b.disabled = true);
-
-    try {
-        const r = await api('/admin/api/youtube/import_channels_json', 'POST', {
-            genre_id: genreId,
-            json_text: raw,
-            mode: mode,
-            max_results: maxResults
-        });
-
-        if (r.ok) {
-            resultBox.style.color = '#2ecc71';
-            const lines = (r.results || []).slice(0, 30).map(x => {
-                if (x.ok) return `✅ ${x.dvd_name || x.channel || 'Canal'} — ${x.inserted || 0} vídeo(s), ${x.skipped || 0} ignorado(s), ${x.duplicated || 0} repetido(s)`;
-                return `❌ ${x.channel || x.name || 'Canal'} — ${x.error || 'erro'}`;
-            });
-            const more = (r.results || []).length > 30 ? `\n... e mais ${(r.results || []).length - 30} canal(is).` : '';
-            resultBox.textContent = `Pronto!\nCanais lidos: ${r.total || 0}\nDVDs criados/reaproveitados: ${r.imported || 0}\nVídeos adicionados: ${r.inserted || 0}\nIgnorados/repetidos/erros: ${(r.skipped || 0) + (r.errors || 0)}\n\n${lines.join('\n')}${more}`;
-            await loadDVDs();
-            await loadPlaylists();
-            await loadGenres();
-            await loadStats();
-        } else {
-            resultBox.style.color = '#e74c3c';
-            resultBox.textContent = r.error || 'Erro ao importar JSON.';
-            alert(r.error || 'Erro ao importar JSON.');
-        }
-    } catch (e) {
-        resultBox.style.color = '#e74c3c';
-        resultBox.textContent = 'Erro no navegador ao chamar o servidor: ' + e;
-        alert('Erro no navegador ao chamar o servidor: ' + e);
-    } finally {
-        btns.forEach(b => b.disabled = false);
-    }
-}
-
 
 // ─── PLAYLISTS ───────────────────────────────────────────────────────────────
 async function loadPlaylists() {
@@ -3325,151 +3232,6 @@ def admin_youtube_import_channel():
     )
     status = 200 if result.get("ok") else 400
     return jsonify(result), status
-
-
-
-def _parse_channels_json_payload(raw):
-    """Lê o JSON do app buscador de canais e devolve uma lista de canais normalizada."""
-    if isinstance(raw, str):
-        raw = raw.strip()
-        if not raw:
-            return []
-        data = json.loads(raw)
-    else:
-        data = raw
-
-    # Aceita lista direta ou objeto com campos comuns.
-    if isinstance(data, dict):
-        for key in ("channels", "canais", "results", "items", "data"):
-            if isinstance(data.get(key), list):
-                data = data.get(key)
-                break
-        else:
-            data = [data]
-
-    if not isinstance(data, list):
-        raise ValueError("JSON inválido. Cole uma lista de canais ou o arquivo JSON exportado pelo app.")
-
-    channels = []
-    seen = set()
-    for item in data:
-        if isinstance(item, str):
-            item = {"handle": item}
-        if not isinstance(item, dict):
-            continue
-
-        name = (
-            item.get("nome") or item.get("name") or item.get("title") or
-            item.get("channelTitle") or item.get("channel_name") or ""
-        )
-        handle = (
-            item.get("handle") or item.get("@") or item.get("customUrl") or
-            item.get("custom_url") or item.get("url_handle") or ""
-        )
-        channel_id = (
-            item.get("channel_id") or item.get("channelId") or item.get("id") or ""
-        )
-        link = (
-            item.get("link_handle") or item.get("link_canal") or item.get("link") or
-            item.get("url") or item.get("channel_url") or ""
-        )
-
-        channel_ref = str(handle or link or channel_id or name).strip()
-        if not channel_ref:
-            continue
-
-        key = (str(channel_id or "").strip().lower() or str(handle or "").strip().lower() or str(link or "").strip().lower() or str(name or "").strip().lower())
-        if key in seen:
-            continue
-        seen.add(key)
-
-        channels.append({
-            "name": str(name or "").strip(),
-            "handle": str(handle or "").strip(),
-            "channel_id": str(channel_id or "").strip(),
-            "link": str(link or "").strip(),
-            "channel_ref": channel_ref,
-        })
-
-    return channels
-
-
-@app.route("/admin/api/youtube/import_channels_json", methods=["POST"])
-def admin_youtube_import_channels_json():
-    """Importa o JSON gerado pelo app de busca: cada canal vira um DVD no gênero escolhido."""
-    err = require_admin()
-    if err: return err
-
-    d = request.json or {}
-    genre_id = d.get("genre_id") or None
-    raw = d.get("json_text")
-    if raw is None:
-        raw = d.get("channels")
-    mode = d.get("mode", "jukebox") or "jukebox"
-
-    try:
-        max_results = int(d.get("max_results") or 50)
-    except Exception:
-        max_results = 50
-    max_results = max(1, min(200, max_results))
-
-    if not genre_id:
-        return jsonify({"ok": False, "error": "Escolha o gênero antes de importar o JSON."}), 400
-
-    try:
-        channels = _parse_channels_json_payload(raw)
-    except Exception as e:
-        return jsonify({"ok": False, "error": "Não consegui ler o JSON: " + str(e)}), 400
-
-    if not channels:
-        return jsonify({"ok": False, "error": "Nenhum canal encontrado no JSON."}), 400
-
-    results = []
-    imported = 0
-    total_inserted = 0
-    total_skipped = 0
-    errors = 0
-
-    # Limite de segurança para não travar o servidor por muito tempo em uma importação gigante.
-    channels = channels[:300]
-
-    for ch in channels:
-        ref = ch.get("link") or ch.get("handle") or ch.get("channel_id") or ch.get("channel_ref") or ch.get("name")
-        dvd_name = ch.get("name") or ch.get("handle") or ch.get("channel_id") or ""
-        try:
-            result = _import_youtube_channel_to_db(
-                genre_id=genre_id,
-                channel_url=ref,
-                dvd_name_input=dvd_name,
-                artist_input=dvd_name,
-                mode=mode,
-                min_minutes=2,
-                max_minutes=7,
-                max_results=max_results,
-            )
-            result["channel"] = dvd_name or ref
-            results.append(result)
-            if result.get("ok"):
-                imported += 1
-                total_inserted += int(result.get("inserted") or 0)
-                total_skipped += int(result.get("skipped") or 0) + int(result.get("duplicated") or 0)
-            else:
-                errors += 1
-                total_skipped += 1
-        except Exception as e:
-            errors += 1
-            total_skipped += 1
-            results.append({"ok": False, "channel": dvd_name or ref, "error": str(e)})
-
-    return jsonify({
-        "ok": True,
-        "total": len(channels),
-        "imported": imported,
-        "inserted": total_inserted,
-        "skipped": total_skipped,
-        "errors": errors,
-        "results": results,
-    })
 
 
 @app.route("/admin/api/playlists/<int:pid>", methods=["DELETE", "PUT"])
