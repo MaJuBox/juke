@@ -1353,7 +1353,6 @@ th { color: var(--muted); font-weight: 600; }
         <button class="btn" onclick="openModal('modal-playlist')">+ Adicionar Música</button>
         <button class="btn btn-ghost" onclick="openModal('modal-bulk-playlist')">📋 Adicionar lista do DVD</button>
         <button class="btn btn-ghost" onclick="openModal('modal-youtube-channel')">📺 Importar canal YouTube</button>
-        <button class="btn btn-ghost" onclick="openModal('modal-json-channels-db')">📦 Importar JSON canais</button>
     </div>
     <div id="playlists-list"></div>
 </div>
@@ -1604,32 +1603,6 @@ th { color: var(--muted); font-weight: 600; }
 </div>
 
 
-
-<div class="modal" id="modal-json-channels-db">
-    <div class="modal-box" style="width:780px">
-        <h2>📦 Importar JSON de canais como DVDs</h2>
-        <p style="color:var(--muted);font-size:13px;margin-bottom:12px">
-            Cole o JSON gerado pelo app buscador. Cada canal será salvo como um DVD real no banco, dentro do gênero escolhido.
-        </p>
-        <label>Gênero</label>
-        <select id="json-db-genre"></select>
-        <label>Modo das músicas</label>
-        <select id="json-db-mode">
-            <option value="jukebox">Jukebox</option>
-            <option value="karaoke">Karaokê</option>
-        </select>
-        <label>Máximo de vídeos por canal</label>
-        <input id="json-db-max-results" type="number" min="1" max="200" value="50">
-        <label>JSON dos canais</label>
-        <textarea id="json-db-text" rows="14" placeholder='Cole aqui o JSON exportado pelo app buscador de canais'></textarea>
-        <div id="json-db-result" style="white-space:pre-wrap;color:var(--muted);font-size:13px;margin-top:10px"></div>
-        <div class="row" style="margin-top:20px;justify-content:flex-end">
-            <button class="btn btn-ghost" onclick="closeModal('modal-json-channels-db')">Cancelar</button>
-            <button class="btn" onclick="importJSONChannelsDB()">Importar e salvar no banco</button>
-        </div>
-    </div>
-</div>
-
 <div class="modal" id="modal-machine-reading">
     <div class="modal-box" style="width:760px">
         <h2>📖 Leitura da Máquina</h2>
@@ -1676,7 +1649,7 @@ function showTab(t) {
 
 function openModal(id) {
     // Garante que os selects de gênero/DVD estejam carregados antes de abrir modais
-    if (id === 'modal-youtube-channel' || id === 'modal-json-channels-db' || id === 'modal-bulk-playlist' || id === 'modal-playlist' || id === 'modal-dvd') {
+    if (id === 'modal-youtube-channel' || id === 'modal-bulk-playlist' || id === 'modal-playlist' || id === 'modal-dvd') {
         loadGenres();
         loadDVDs();
     }
@@ -1911,13 +1884,6 @@ async function deleteGenre(id) {
     }
 }
 
-
-async function fillJsonDbGenreSelect() {
-    const d = await api('/admin/api/genres');
-    const sel = document.getElementById('json-db-genre');
-    if (sel) sel.innerHTML = (d.genres || []).map(g => '<option value="' + g.id + '">' + g.name + '</option>').join('');
-}
-
 // ─── DVDs ────────────────────────────────────────────────────────────────────
 async function loadDVDs() {
     const gid = document.getElementById('dvd-genre-filter').value;
@@ -2147,62 +2113,6 @@ async function saveEditedPlaylist() {
 async function deletePlaylist(id) {
     await api('/admin/api/playlists/' + id, 'DELETE');
     loadPlaylists();
-}
-
-
-async function importJSONChannelsDB() {
-    const box = document.getElementById('json-db-result');
-    const genreId = document.getElementById('json-db-genre').value;
-    const raw = document.getElementById('json-db-text').value.trim();
-    const maxResults = document.getElementById('json-db-max-results').value || '50';
-    const mode = document.getElementById('json-db-mode').value || 'jukebox';
-
-    if (!genreId) {
-        box.style.color = '#e74c3c';
-        box.textContent = 'Escolha um gênero.';
-        return;
-    }
-    if (!raw) {
-        box.style.color = '#e74c3c';
-        box.textContent = 'Cole o JSON dos canais.';
-        return;
-    }
-
-    box.style.color = 'var(--yellow)';
-    box.textContent = 'Importando e salvando no banco... Aguarde.';
-
-    try {
-        const r = await api('/admin/api/youtube/import_channels_json_db', 'POST', {
-            genre_id: genreId,
-            channels_json: raw,
-            max_results: maxResults,
-            mode: mode
-        });
-
-        if (r.ok) {
-            box.style.color = '#2ecc71';
-            let msg = 'Pronto!\n';
-            msg += 'Canais no JSON: ' + (r.total || 0) + '\n';
-            msg += 'DVDs salvos: ' + (r.dvds_saved || 0) + '\n';
-            msg += 'Músicas salvas: ' + (r.playlists_saved || 0) + '\n';
-            msg += 'Ignorados/repetidos: ' + (r.skipped || 0) + '\n';
-            msg += 'Erros: ' + (r.failed || 0) + '\n\n';
-            (r.results || []).slice(0, 80).forEach(function(x) {
-                msg += '- ' + (x.dvd_name || x.name || x.channel || 'canal') + ': ' + (x.ok ? ('OK, ' + (x.inserted || 0) + ' músicas') : ('ERRO - ' + (x.error || 'falhou'))) + '\n';
-            });
-            box.textContent = msg;
-            await loadDVDs();
-            await loadPlaylists();
-            await loadGenres();
-            await loadStats();
-        } else {
-            box.style.color = '#e74c3c';
-            box.textContent = r.error || 'Erro ao importar.';
-        }
-    } catch (e) {
-        box.style.color = '#e74c3c';
-        box.textContent = 'Erro no navegador: ' + e;
-    }
 }
 
 // ─── PAGAMENTOS ──────────────────────────────────────────────────────────────
@@ -2630,70 +2540,45 @@ def admin_genre_delete(gid):
     return jsonify({"ok": True})
 
 
-
 @app.route("/admin/api/dvds", methods=["GET", "POST"])
 def admin_dvds():
     err = require_admin()
     if err: return err
-
     with get_db() as db:
         if request.method == "POST":
-            d = request.json or {}
+            d = request.json
             if not d.get("name") or not d.get("genre_id"):
-                return jsonify({"ok": False, "error": "Nome e gênero obrigatórios"}), 400
-
-            next_order = db.execute(
-                "SELECT COALESCE(MAX(sort_order), 0) + 1 FROM dvds WHERE genre_id=?",
-                (d.get("genre_id"),)
-            ).fetchone()[0] or 1
-
-            db.execute(
-                "INSERT INTO dvds(genre_id,name,cover_url,sort_order) VALUES(?,?,?,?)",
-                (d.get("genre_id"), d.get("name"), d.get("cover_url", ""), next_order)
-            )
+                return jsonify({"ok": False, "error": "Nome e gênero obrigatórios"})
+            db.execute("INSERT INTO dvds(genre_id,name,cover_url) VALUES(?,?,?)",
+                       (d["genre_id"], d["name"], d.get("cover_url", "")))
             db.commit()
             return jsonify({"ok": True})
 
         gid = request.args.get("genre_id")
-
-        q = (
-            "SELECT "
-            "d.id, d.genre_id, d.name, d.cover_url, d.sort_order, "
-            "g.name AS genre_name, "
-            "COALESCE(pc.song_count, 0) AS song_count "
-            "FROM dvds d "
-            "LEFT JOIN genres g ON g.id = d.genre_id "
-            "LEFT JOIN ("
-            "  SELECT dvd_id, COUNT(*) AS song_count "
-            "  FROM playlists "
-            "  WHERE dvd_id IS NOT NULL "
-            "  GROUP BY dvd_id"
-            ") pc ON pc.dvd_id = d.id "
-        )
-
+        q = """
+            SELECT d.*, g.name as genre_name,
+                   COUNT(p.id) as song_count
+            FROM dvds d
+            LEFT JOIN genres g ON g.id = d.genre_id
+            LEFT JOIN playlists p ON p.dvd_id = d.id
+        """
         args = ()
         if gid:
-            q += " WHERE d.genre_id = ? "
+            q += " WHERE d.genre_id = ?"
             args = (gid,)
-
-        q += " ORDER BY COALESCE(d.genre_id, 0), COALESCE(d.sort_order, 0), d.name"
-
+        q += " GROUP BY d.id ORDER BY d.genre_id, d.sort_order"
         dvds = [dict(d) for d in db.execute(q, args).fetchall()]
-        return jsonify({"ok": True, "dvds": dvds})
+        return jsonify({"dvds": dvds})
 
 
 @app.route("/admin/api/dvds/<int:did>", methods=["DELETE"])
 def admin_dvd_delete(did):
     err = require_admin()
     if err: return err
-
     with get_db() as db:
-        db.execute("DELETE FROM playlists WHERE dvd_id=?", (did,))
         db.execute("DELETE FROM dvds WHERE id=?", (did,))
         db.commit()
-
     return jsonify({"ok": True})
-
 
 
 @app.route("/admin/api/playlists", methods=["GET", "POST"])
@@ -3517,227 +3402,135 @@ def index():
 
 
 
-
-def _json_channel_value(ch, *keys):
-    for k in keys:
-        v = ch.get(k)
-        if v is not None and str(v).strip():
-            return str(v).strip()
-    return ""
-
-
-def _normalize_channel_url_from_json(ch):
-    channel_url = _json_channel_value(
-        ch,
-        "link_handle", "link_canal", "channel_url", "url", "link",
-        "handle", "channel_id", "channelId", "id"
-    )
-    if not channel_url:
-        return ""
-    if channel_url.startswith("UC"):
-        return "https://www.youtube.com/channel/" + channel_url
-    if channel_url.startswith("@"):
-        return "https://www.youtube.com/" + channel_url
-    return channel_url
-
-
-def _extract_channel_id_for_duplicate(channel_url):
-    txt = str(channel_url or "").strip()
-    if not txt:
-        return ""
-    m = re.search(r"/channel/(UC[0-9A-Za-z_-]{10,})", txt)
-    if m:
-        return m.group(1)
-    if txt.startswith("UC"):
-        return txt
-    # handle ou URL normal
-    return txt.rstrip("/").split("/")[-1].lower()
-
-
-def _get_or_create_dvd_db(db, genre_id, dvd_name, cover_url="", channel_url=""):
-    """Salva o canal como DVD REAL na tabela dvds do banco do app."""
-    dvd_name = str(dvd_name or "Canal YouTube").strip()[:180]
-    cover_url = str(cover_url or "").strip()
-    key = _extract_channel_id_for_duplicate(channel_url) or dvd_name.lower()
-
-    # Evita duplicar DVD pelo nome no mesmo genero.
-    existing = db.execute(
-        "SELECT * FROM dvds WHERE genre_id=? AND LOWER(name)=LOWER(?) LIMIT 1",
-        (genre_id, dvd_name)
-    ).fetchone()
-    if existing:
-        return existing["id"] if hasattr(existing, "keys") else existing[0], False
-
-    max_order = db.execute("SELECT COALESCE(MAX(sort_order), 0) FROM dvds WHERE genre_id=?", (genre_id,)).fetchone()[0] or 0
-    cur = db.execute(
-        "INSERT INTO dvds(genre_id,name,cover_url,sort_order) VALUES(?,?,?,?)",
-        (genre_id, dvd_name, cover_url, int(max_order) + 1)
-    )
-    dvd_id = getattr(cur, "lastrowid", None)
-    if not dvd_id:
-        row = db.execute("SELECT id FROM dvds WHERE genre_id=? AND LOWER(name)=LOWER(?) ORDER BY id DESC LIMIT 1", (genre_id, dvd_name)).fetchone()
-        dvd_id = row["id"] if hasattr(row, "keys") else row[0]
-    return dvd_id, True
-
-
-def _save_playlist_video_db(db, genre_id, dvd_id, video, artist, mode):
-    """Salva video REAL na tabela playlists, ligado ao genero e ao DVD."""
-    youtube_id = str(video.get("youtube_id") or video.get("id") or video.get("videoId") or "").strip()
-    title = str(video.get("title") or video.get("name") or "").strip()
-    if not youtube_id or not title:
-        return False, "sem youtube_id ou titulo"
-
-    exists = db.execute(
-        "SELECT id FROM playlists WHERE youtube_id=? AND dvd_id=? LIMIT 1",
-        (youtube_id, dvd_id)
-    ).fetchone()
-    if exists:
-        return False, "duplicado"
-
-    max_order = db.execute("SELECT COALESCE(MAX(sort_order), 0) FROM playlists WHERE dvd_id=?", (dvd_id,)).fetchone()[0] or 0
-    video_url = str(video.get("video_url") or video.get("url") or ("https://www.youtube.com/watch?v=" + youtube_id)).strip()
-    cover_url = str(video.get("cover_url") or video.get("thumbnail") or video.get("thumb") or "").strip()
-    db.execute(
-        "INSERT INTO playlists(genre_id,dvd_id,title,artist,youtube_id,video_url,cover_url,mode,sort_order) VALUES(?,?,?,?,?,?,?,?,?)",
-        (genre_id, dvd_id, title, artist or "", youtube_id, video_url, cover_url, mode or "jukebox", int(max_order) + 1)
-    )
-    return True, "ok"
-
-
-def _fetch_youtube_videos_for_channel_db(channel_url, max_results=50, min_minutes=2, max_minutes=7):
-    """Usa a funcao original do app se existir; senao tenta endpoint do YouTube.
-    Retorna lista de dicts: title, youtube_id, cover_url, duration_seconds.
+# ─── API externa para app buscador de canais ───────────────────────────────────
+def _external_admin_ok(data=None):
+    """Autoriza app externo sem sessão do navegador.
+    Use a senha admin em X-MajuBox-Admin-Password ou no JSON como admin_password.
     """
-    # Se seu app.py original ja tiver funcao pronta, usa ela.
-    for fname in ["_fetch_youtube_channel_videos", "fetch_youtube_channel_videos", "_get_youtube_channel_videos"]:
-        fn = globals().get(fname)
-        if callable(fn):
-            try:
-                return fn(channel_url, max_results=max_results, min_minutes=min_minutes, max_minutes=max_minutes)
-            except TypeError:
-                try:
-                    return fn(channel_url, max_results)
-                except Exception:
-                    pass
-            except Exception:
-                pass
-
-    # Fallback minimo: se nao tiver funcao de buscar videos, nao inventa.
-    return []
+    data = data or {}
+    password = (
+        request.headers.get("X-MajuBox-Admin-Password")
+        or request.args.get("admin_password")
+        or data.get("admin_password")
+        or ""
+    )
+    return str(password) == str(ADMIN_PASSWORD)
 
 
-@app.route("/admin/api/youtube/import_channels_json_db", methods=["POST"])
-def admin_import_channels_json_db():
-    """Importa JSON do buscador e salva no banco base do MajuBox.
+@app.route("/api/external/genres", methods=["GET", "POST", "OPTIONS"])
+def external_genres():
+    """Lista gêneros para o app externo escolher onde salvar os DVDs."""
+    if request.method == "OPTIONS":
+        return jsonify({"ok": True})
+    data = request.get_json(silent=True) or {}
+    if not _external_admin_ok(data):
+        return jsonify({"ok": False, "error": "Senha admin inválida para comunicação externa."}), 403
+    with get_db() as db:
+        genres = [dict(g) for g in db.execute("SELECT id,name,cover_url,sort_order FROM genres ORDER BY sort_order,name").fetchall()]
+    return jsonify({"ok": True, "genres": genres})
 
-    Tabelas usadas:
-    - genres: usa o genero escolhido
-    - dvds: cada canal vira um DVD real
-    - playlists: cada video importado entra ligado ao DVD
+
+@app.route("/api/external/youtube/import_channel", methods=["POST", "OPTIONS"])
+def external_youtube_import_channel():
+    """Recebe 1 canal do app buscador e salva como DVD no banco base."""
+    if request.method == "OPTIONS":
+        return jsonify({"ok": True})
+    d = request.get_json(silent=True) or {}
+    if not _external_admin_ok(d):
+        return jsonify({"ok": False, "error": "Senha admin inválida para comunicação externa."}), 403
+
+    result = _import_youtube_channel_to_db(
+        genre_id=d.get("genre_id"),
+        channel_url=(d.get("channel_url") or d.get("channel_id") or d.get("handle") or "").strip(),
+        dvd_name_input=(d.get("dvd_name") or d.get("name") or d.get("nome") or "").strip(),
+        artist_input=(d.get("artist") or d.get("nome") or d.get("name") or "").strip(),
+        mode=d.get("mode", "jukebox") or "jukebox",
+        min_minutes=2,
+        max_minutes=7,
+        max_results=d.get("max_results", 200),
+    )
+    status = 200 if result.get("ok") else 400
+    return jsonify(result), status
+
+
+@app.route("/api/external/youtube/import_channels", methods=["POST", "OPTIONS"])
+def external_youtube_import_channels():
+    """Recebe vários canais do app buscador.
+    Cada canal vira DVD no gênero escolhido e os vídeos entram em playlists.
     """
-    data = request.json or {}
-    genre_id = data.get("genre_id")
-    raw = (data.get("channels_json") or "").strip()
-    mode = data.get("mode") or "jukebox"
+    if request.method == "OPTIONS":
+        return jsonify({"ok": True})
+    d = request.get_json(silent=True) or {}
+    if not _external_admin_ok(d):
+        return jsonify({"ok": False, "error": "Senha admin inválida para comunicação externa."}), 403
+
+    genre_id = d.get("genre_id")
+    mode = d.get("mode", "jukebox") or "jukebox"
     try:
-        max_results = int(data.get("max_results") or 50)
+        max_results = int(d.get("max_results") or 200)
     except Exception:
-        max_results = 50
+        max_results = 200
     max_results = max(1, min(200, max_results))
 
+    channels = d.get("channels") or []
     if not genre_id:
-        return jsonify({"ok": False, "error": "Escolha um genero."}), 400
-    if not raw:
-        return jsonify({"ok": False, "error": "Cole o JSON dos canais."}), 400
-
-    try:
-        parsed = json.loads(raw)
-    except Exception as e:
-        return jsonify({"ok": False, "error": "JSON invalido: " + str(e)}), 400
-
-    if isinstance(parsed, dict):
-        channels = parsed.get("channels") or parsed.get("canais") or parsed.get("results") or parsed.get("data") or []
-    elif isinstance(parsed, list):
-        channels = parsed
-    else:
-        channels = []
-
-    if not channels:
-        return jsonify({"ok": False, "error": "Nenhum canal encontrado no JSON."}), 400
+        return jsonify({"ok": False, "error": "Escolha um gênero."}), 400
+    if not isinstance(channels, list) or not channels:
+        return jsonify({"ok": False, "error": "Nenhum canal recebido."}), 400
 
     results = []
-    dvds_saved = 0
-    playlists_saved = 0
-    skipped = 0
+    imported = 0
     failed = 0
     seen = set()
 
-    with get_db() as db:
-        g = db.execute("SELECT id, name FROM genres WHERE id=?", (genre_id,)).fetchone()
-        if not g:
-            return jsonify({"ok": False, "error": "Genero nao encontrado no banco."}), 404
+    for ch in channels:
+        if not isinstance(ch, dict):
+            continue
 
-        for ch in channels:
-            if not isinstance(ch, dict):
-                skipped += 1
-                continue
+        name = (
+            ch.get("nome") or ch.get("name") or ch.get("title") or
+            ch.get("channelTitle") or ch.get("handle") or ch.get("channel_id") or "Canal"
+        )
+        channel_url = (
+            ch.get("channel_url") or ch.get("link_handle") or ch.get("url") or ch.get("link") or
+            ch.get("link_canal") or ch.get("handle") or ch.get("channel_id") or ch.get("channelId") or ""
+        )
 
-            dvd_name = _json_channel_value(ch, "nome", "name", "title", "channelTitle", "handle", "channel_id", "channelId") or "Canal YouTube"
-            channel_url = _normalize_channel_url_from_json(ch)
-            cover_url = _json_channel_value(ch, "thumbnail", "cover_url", "avatar", "image", "foto")
-            artist = dvd_name
-            key = _extract_channel_id_for_duplicate(channel_url) or dvd_name.lower()
-            if key in seen:
-                skipped += 1
-                continue
-            seen.add(key)
+        channel_url = str(channel_url or "").strip()
+        if channel_url.startswith("UC"):
+            channel_url = "https://www.youtube.com/channel/" + channel_url
+        elif channel_url.startswith("@"):
+            channel_url = "https://www.youtube.com/" + channel_url
 
-            try:
-                dvd_id, created = _get_or_create_dvd_db(db, genre_id, dvd_name, cover_url, channel_url)
-                if created:
-                    dvds_saved += 1
+        key = channel_url.lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
 
-                videos = []
-                # Se o JSON ja vier com videos, salva direto.
-                if isinstance(ch.get("videos"), list):
-                    videos = ch.get("videos")
-                elif isinstance(ch.get("playlists"), list):
-                    videos = ch.get("playlists")
-                else:
-                    videos = _fetch_youtube_videos_for_channel_db(channel_url, max_results=max_results, min_minutes=2, max_minutes=7)
+        result = _import_youtube_channel_to_db(
+            genre_id=genre_id,
+            channel_url=channel_url,
+            dvd_name_input=str(name),
+            artist_input=str(name),
+            mode=mode,
+            min_minutes=2,
+            max_minutes=7,
+            max_results=max_results,
+        )
 
-                inserted = 0
-                repeated = 0
-                for video in videos or []:
-                    if not isinstance(video, dict):
-                        continue
-                    try:
-                        if _is_probable_short_video(video):
-                            repeated += 1
-                            continue
-                    except Exception:
-                        pass
-                    ok, reason = _save_playlist_video_db(db, genre_id, dvd_id, video, artist, mode)
-                    if ok:
-                        inserted += 1
-                        playlists_saved += 1
-                    else:
-                        repeated += 1
-
-                results.append({"ok": True, "name": dvd_name, "dvd_name": dvd_name, "dvd_id": dvd_id, "created": created, "inserted": inserted, "skipped": repeated})
-            except Exception as e:
-                failed += 1
-                results.append({"ok": False, "name": dvd_name, "channel": channel_url, "error": str(e)})
-
-        db.commit()
+        result["source_channel"] = channel_url
+        result["source_name"] = str(name)
+        if result.get("ok"):
+            imported += 1
+        else:
+            failed += 1
+        results.append(result)
 
     return jsonify({
         "ok": True,
-        "total": len(channels),
+        "total_received": len(channels),
         "processed": len(seen),
-        "dvds_saved": dvds_saved,
-        "playlists_saved": playlists_saved,
-        "skipped": skipped,
+        "imported": imported,
         "failed": failed,
         "results": results
     })
