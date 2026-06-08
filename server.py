@@ -3536,6 +3536,207 @@ def external_youtube_import_channels():
     })
 
 
+
+# ─── Página separada: DVDs importados ─────────────────────────────────────────
+@app.route("/admin/dvds-importados", methods=["GET", "POST"])
+def admin_dvds_importados_page():
+    if not session.get("admin"):
+        return redirect("/admin/login")
+
+    message = ""
+    error = ""
+
+    with get_db() as db:
+        if request.method == "POST":
+            action = (request.form.get("action") or "").strip()
+            dvd_id = (request.form.get("dvd_id") or "").strip()
+
+            if action == "delete" and dvd_id:
+                try:
+                    db.execute("DELETE FROM playlists WHERE dvd_id=?", (dvd_id,))
+                    db.execute("DELETE FROM dvds WHERE id=?", (dvd_id,))
+                    db.commit()
+                    message = "DVD excluído com sucesso."
+                except Exception as e:
+                    error = "Erro ao excluir DVD: " + str(e)
+
+        genre_filter = (request.args.get("genre_id") or "").strip()
+        search = (request.args.get("q") or "").strip()
+
+        genres = [dict(g) for g in db.execute(
+            "SELECT id, name FROM genres ORDER BY sort_order, name"
+        ).fetchall()]
+
+        q = (
+            "SELECT "
+            "d.id, d.genre_id, d.name, d.cover_url, d.sort_order, "
+            "g.name AS genre_name, "
+            "COALESCE(pc.song_count, 0) AS song_count "
+            "FROM dvds d "
+            "LEFT JOIN genres g ON g.id = d.genre_id "
+            "LEFT JOIN ("
+            "  SELECT dvd_id, COUNT(*) AS song_count "
+            "  FROM playlists "
+            "  WHERE dvd_id IS NOT NULL "
+            "  GROUP BY dvd_id"
+            ") pc ON pc.dvd_id = d.id "
+        )
+
+        where = []
+        args = []
+
+        if genre_filter:
+            where.append("d.genre_id=?")
+            args.append(genre_filter)
+
+        if search:
+            where.append("(LOWER(d.name) LIKE LOWER(?) OR LOWER(COALESCE(g.name,'')) LIKE LOWER(?))")
+            args.extend(["%" + search + "%", "%" + search + "%"])
+
+        if where:
+            q += " WHERE " + " AND ".join(where)
+
+        q += " ORDER BY COALESCE(g.sort_order, 0), g.name, COALESCE(d.sort_order, 0), d.name"
+
+        dvds = [dict(d) for d in db.execute(q, tuple(args)).fetchall()]
+
+    html = """
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MajuBox — DVDs Importados</title>
+<style>
+* { box-sizing: border-box; }
+body { margin:0; background:#0a0a0f; color:#eee; font-family:Segoe UI, Arial, sans-serif; }
+header { background:#13131a; border-bottom:1px solid #1e1e2e; padding:16px 24px; display:flex; align-items:center; gap:12px; }
+h1 { color:#e50914; font-size:20px; margin:0; }
+a { color:#ddd; text-decoration:none; }
+.wrap { max-width:1180px; margin:0 auto; padding:24px; }
+.top { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:18px; flex-wrap:wrap; }
+.card { background:#13131a; border:1px solid #1e1e2e; border-radius:12px; padding:16px; margin-bottom:16px; }
+.row { display:flex; gap:10px; flex-wrap:wrap; align-items:end; }
+label { display:block; color:#888; font-size:12px; margin-bottom:5px; }
+input, select { background:#1a1a24; color:#eee; border:1px solid #1e1e2e; border-radius:8px; padding:9px 10px; min-width:220px; }
+button, .btn { background:#e50914; color:#fff; border:0; border-radius:8px; padding:9px 14px; cursor:pointer; font-size:13px; display:inline-block; }
+.btn-ghost { background:transparent; border:1px solid #333; color:#eee; }
+.btn-red { background:#5c0d0d; }
+.msg { background:#0d2e1a; color:#2ecc71; border:1px solid #145c2c; padding:10px; border-radius:8px; margin-bottom:14px; }
+.err { background:#2e0d0d; color:#e74c3c; border:1px solid #5c0d0d; padding:10px; border-radius:8px; margin-bottom:14px; }
+table { width:100%; border-collapse:collapse; background:#13131a; border:1px solid #1e1e2e; border-radius:12px; overflow:hidden; }
+th, td { padding:10px 12px; border-bottom:1px solid #1e1e2e; text-align:left; font-size:13px; vertical-align:middle; }
+th { color:#888; font-weight:600; background:#101018; }
+tr:hover td { background:#171722; }
+.cover { width:54px; height:54px; object-fit:cover; border-radius:8px; background:#222; border:1px solid #333; }
+.muted { color:#888; font-size:12px; }
+.count { color:#e50914; font-weight:700; }
+@media (max-width:760px){ table { font-size:12px; } .hide-mobile { display:none; } input, select { min-width:160px; width:100%; } }
+</style>
+</head>
+<body>
+<header>
+  <div style="font-size:24px">🎵</div>
+  <div>
+    <h1>MajuBox</h1>
+    <div class="muted">DVDs cadastrados/importados</div>
+  </div>
+  <div style="margin-left:auto;display:flex;gap:10px;align-items:center">
+    <a class="btn btn-ghost" href="/admin">Voltar ao painel</a>
+    <a class="muted" href="/admin/logout">Sair</a>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="top">
+    <div>
+      <h2 style="margin:0">📀 DVDs importados</h2>
+      <div class="muted">Lista separada para não mexer nas abas do painel principal.</div>
+    </div>
+    <div class="count">{{ dvds|length }} DVD(s)</div>
+  </div>
+
+  {% if message %}<div class="msg">{{ message }}</div>{% endif %}
+  {% if error %}<div class="err">{{ error }}</div>{% endif %}
+
+  <div class="card">
+    <form method="GET" action="/admin/dvds-importados" class="row">
+      <div>
+        <label>Gênero</label>
+        <select name="genre_id">
+          <option value="">Todos os gêneros</option>
+          {% for g in genres %}
+            <option value="{{ g.id }}" {% if selected_genre|string == g.id|string %}selected{% endif %}>{{ g.name }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div>
+        <label>Buscar por nome</label>
+        <input name="q" value="{{ search }}" placeholder="Nome do DVD ou gênero">
+      </div>
+      <button type="submit">Filtrar</button>
+      <a class="btn btn-ghost" href="/admin/dvds-importados">Limpar</a>
+    </form>
+  </div>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Capa</th>
+        <th>DVD</th>
+        <th>Gênero</th>
+        <th>Músicas</th>
+        <th class="hide-mobile">ID</th>
+        <th>Ações</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for d in dvds %}
+      <tr>
+        <td>
+          {% if d.cover_url %}
+            <img class="cover" src="{{ d.cover_url }}" onerror="this.style.display='none'">
+          {% else %}
+            <div class="cover"></div>
+          {% endif %}
+        </td>
+        <td>
+          <strong>{{ d.name }}</strong>
+          <div class="muted">Ordem: {{ d.sort_order or 0 }}</div>
+        </td>
+        <td>{{ d.genre_name or '' }}</td>
+        <td>{{ d.song_count or 0 }}</td>
+        <td class="hide-mobile">{{ d.id }}</td>
+        <td>
+          <form method="POST" action="/admin/dvds-importados?genre_id={{ selected_genre }}&q={{ search }}" onsubmit="return confirm('Excluir este DVD e todas as músicas dele?');">
+            <input type="hidden" name="action" value="delete">
+            <input type="hidden" name="dvd_id" value="{{ d.id }}">
+            <button class="btn-red" type="submit">Excluir</button>
+          </form>
+        </td>
+      </tr>
+      {% else %}
+      <tr>
+        <td colspan="6" class="muted" style="padding:24px;text-align:center">Nenhum DVD encontrado.</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+</body>
+</html>
+"""
+    return render_template_string(
+        html,
+        dvds=dvds,
+        genres=genres,
+        selected_genre=genre_filter,
+        search=search,
+        message=message,
+        error=error
+    )
+
+
 if __name__ == "__main__":
     print("=" * 55)
     print("  🎵 MajuBox — Servidor Central")
